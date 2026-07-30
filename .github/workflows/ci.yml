@@ -1,0 +1,157 @@
+# Continuous integration.
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# THIS FILE IS TEMPORARY. Once `cloudsforge/.github` exists (AD-03) everything below except the
+# three repository-specific rules at the bottom is deleted and replaced by a call to the shared
+# reusable workflow. The measured target in docs/ecosystem/03 §5 is zero repositories with a
+# bespoke CI file, so treat every line here as a liability with a deletion date rather than as
+# something to extend.
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        # Not a secret: this database exists for the duration of one job, is reachable only from
+        # it, and holds nothing. A real value here would be a real value in a public log.
+        env:
+          POSTGRES_USER: worlds
+          POSTGRES_PASSWORD: worlds
+          POSTGRES_DB: worlds_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U worlds"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # Temporary: the three checkouts and the sibling layout exist only because the runtime and
+      # contracts packages are unpublished. On publish this collapses to one checkout.
+      - uses: actions/checkout@v4
+        with: { path: worlds }
+      - uses: actions/checkout@v4
+        with: { repository: cloudsforge/micro-runtime, path: runtime }
+      - uses: actions/checkout@v4
+        with: { repository: cloudsforge/micro-contracts, path: contracts }
+
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.9.0 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: worlds/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: worlds
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: worlds
+        run: pnpm typecheck
+
+      - name: Migrate the test database
+        working-directory: worlds
+        # The migrator is exercised as a migrator, on an empty database, exactly as a deploy runs
+        # it. A schema created by the test suite instead would never prove the one-shot job works —
+        # and this service's three CHECK constraints only exist because that job ran.
+        env:
+          WORLDS_DATABASE_URL: postgres://worlds:worlds@127.0.0.1:5432/worlds_test
+          IDENTITY_JWKS_URL: http://127.0.0.1:4001/.well-known/jwks.json
+          IDENTITY_ISSUER: http://127.0.0.1:4001
+          OUTBOX_SIGNING_SECRET: ci-only-not-a-real-secret-000000000000
+          LEDGER_URL: http://127.0.0.1:4007
+          BILLING_URL: http://127.0.0.1:4009
+          WORLDS_SERVICE_TOKEN: ci-only-not-a-real-token-0000000000000
+        run: pnpm migrate
+
+      - name: Test
+        working-directory: worlds
+        env:
+          WORLDS_TEST_DATABASE_URL: postgres://worlds:worlds@127.0.0.1:5432/worlds_test
+        run: pnpm test
+
+  # The estate-wide rules from docs/ecosystem/03 §2, as checks rather than as review discipline.
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 'Rule 1 — one database, and it is this service''s own'
+        run: |
+          if grep -rnE '[A-Z_]*DATABASE_URL' src/ --include='*.ts' \
+             | grep -vE 'WORLDS_DATABASE_URL|WORLDS_TEST_DATABASE_URL'; then
+            echo '::error::a connection string other than WORLDS_DATABASE_URL is referenced'
+            exit 1
+          fi
+          if grep -rnE '(postgres|postgresql)://' src/ --include='*.ts' | grep -v '\.test\.ts'; then
+            echo '::error::a literal connection string appears outside a test'
+            exit 1
+          fi
+
+      - name: 'Rule 4 — livez, readyz and metrics exist'
+        run: |
+          for endpoint in /livez /readyz /metrics; do
+            grep -q "'$endpoint'" src/server.ts \
+              || { echo "::error::$endpoint is not served"; exit 1; }
+          done
+
+      - name: 'Rule 7 — migrations are never run by the service process'
+        run: |
+          if grep -nE '\bmigrate\(' src/index.ts; then
+            echo '::error::index.ts calls migrate — that is the migrator job, not the service'
+            exit 1
+          fi
+
+      - name: 'Rule 8 — every background timer is a leased job'
+        # Comment lines are excluded: this repository DISCUSSES the frozen service's timers, and a
+        # check that cannot tell a timer from a sentence about one is a check people learn to
+        # ignore.
+        run: |
+          if grep -rnE '\bset(Interval|Timeout)\(' src/ --include='*.ts' \
+             | grep -v '\.test\.ts' \
+             | grep -vE '^[^:]+:[0-9]+: *(//|\*)'; then
+            echo '::error::a timer was found; background work is a leased job (@cloudsforge/jobs)'
+            exit 1
+          fi
+
+      # The two controls this service exists to add, asserted as text so they cannot be deleted in
+      # a refactor without a red build. The tests prove they WORK; these prove they are still THERE.
+      - name: 'The bound constraint and the season budget cap still exist'
+        run: |
+          grep -q 'inventory_items_bound_not_listed' src/migrations.ts \
+            || { echo '::error::the bound constraint is gone; a power item could be listed for sale'; exit 1; }
+          grep -q 'seasons_within_budget' src/migrations.ts \
+            || { echo '::error::the season budget cap is gone; a reward exploit would be unbounded'; exit 1; }
+
+      - name: 'The entitlement webhook still verifies a signature'
+        run: |
+          grep -q 'timingSafeEqual' src/server.ts \
+            || { echo '::error::the event signature check is gone; POST /v1/events is a free-worlds endpoint'; exit 1; }
+
+      # A `*/` in the MIDDLE of a block comment terminates it early and silently uncomments
+      # whatever follows. The pattern matches a continuation line of a block comment (leading `*`)
+      # that carries a `*/` with more text after it — which is the only shape that does damage.
+      # A single-line `/** … */` is fine and is not matched.
+      - name: 'No comment-terminating sequence inside a block comment'
+        run: |
+          if grep -rnE '^\s*\*.*\*/.+' src/ --include='*.ts'; then
+            echo '::error::a */ appears mid-way through a block comment and terminates it early'
+            exit 1
+          fi
