@@ -1,0 +1,317 @@
+# `micro-worlds`
+
+The title registry, the cross-title player profile and inventory, achievements, seasons, rewards
+that are real money — and **the entitlement bridge**: the consumer of
+`billing.entitlement.granted` that finally turns a paid private world into a world that exists.
+
+> **It owns nothing a title owns.** A title service owns simulation state; this service owns
+> anything that must outlive a season or cross a title (`src/migrations.ts:120-121`). It also holds
+> no money: a reward is a posting to `micro-ledger`, and the budget that bounds it is a database
+> CHECK, not a counter in a handler.
+
+> **A bound item cannot be listed for sale, and that is a CHECK constraint.**
+> `inventory_items_bound_not_listed` (`src/migrations.ts:206`). 04-domain-model §7.3 — "anything
+> conferring power is bound and cannot enter the market" — expressed in the schema **because a rule
+> in a route is a rule that the next route forgets** (`src/migrations.ts:196-205`).
+
+---
+
+## The entitlement bridge
+
+`src/provisioning.ts:1-37` is the most important file header in the repository. The short version:
+
+The estate sells `private_skirmish` for 1,800 Shards and `private_saga` for 2,500. Pay debits the
+balance, writes an `entitlements` row with the world name the customer typed into its `meta`, and
+returns 201. **Nothing then reads that row.** The seller's own source says
+
+```
+// The game service later reads this to actually provision the world (out of scope here).
+```
+
+**and that consumer has never existed.** The only world-creation path in the estate is an
+operator-only `POST /admin/worlds` which takes no user, no entitlement and no owner, because
+`worlds` has no column to put one in. The rental is excluded from Pay's own-once unique index and
+takes no idempotency key, so **the same customer can be charged for the same undelivered world as
+many times as they press the button**. The shop's own source calls this "WITHHELD", and the
+mitigation that shipped was to hide the button.
+
+Six things had to exist before a provisioner could be written at all, and each now does
+(`src/provisioning.ts:19-36`):
+
+| # | What | Where it now is |
+| --- | --- | --- |
+| 1 | a service-readable entitlement API | billing's `GET /internal/entitlements/:userId` and the `billing.entitlement.granted` event. Pay's is Bearer-only, so **no background job could ever ask** — which is why no async fulfilment of any kind is possible there |
+| 2 | a provisioning marker | `provisions.state` (`src/migrations.ts:257`). Pay's entitlements table has no state column at all; only `meta` is free |
+| 3 | idempotent creation keyed on the entitlement | `provisions_entitlement_uniq` (`src/migrations.ts:267`), and the same id sent to the title as its idempotency key |
+| 4 | owner, visibility and capacity on a world | the title's business, behind `service_url`, carried in `metadata` |
+| 5 | an operator view of failed rentals | `GET /v1/provisions?state=failed` (`src/server.ts:642`) plus `worlds_provisions_total{outcome}` |
+| 6 | a refund path | not this service's to perform — billing owns revocation — but `worlds.provision.failed` names the entitlement and starts one |
+
+### Consume, then provision. Never both in one step.
+
+The webhook does one thing: `withInbox` plus one INSERT. **It does not call the title**, because a
+title that is slow would then make billing's relay time out and redeliver — and **a bridge whose
+delivery pressure is coupled to a title's provisioning latency is a bridge that melts on the day a
+title is slow**. The job does the calling, under a lease, with a bounded attempt budget
+(`src/provisioning.ts:39-45`, enqueue at `src/server.ts:440-446`).
+
+### Three failure modes, and why they are three
+
+`src/titleclient.ts:166-186` uses `HttpError.peerDecided` as the discriminator, and
+`driveProvision` acts on each differently (`src/provisioning.ts:464-479`):
+
+| Error | Meaning | What the row becomes |
+| --- | --- | --- |
+| `TitleUnsupportedError` (422, or `code: unsupported`) | the title cannot do this, ever | `state = 'unsupported'` — terminal, with a reason (`src/provisioning.ts:465-467`) |
+| `TitleRefusedError` (any other 4xx) | the title **looked at it and said no** | `state = 'failed'` — permanent for this request; retrying is a guaranteed second refusal and a second burnt attempt (`src/provisioning.ts:468-472`) |
+| `TitleUnavailableError` (5xx, timeout, open circuit) | **we do not know whether it provisioned** | the row keeps everything it has, the lease is released, and the next tick sends **the same entitlement id** — which the title recognises (`src/provisioning.ts:473-477`) |
+
+"That distinction is what keeps a title having a bad minute from turning into a refund queue"
+(`src/titleclient.ts:174`).
+
+A 2xx carrying no `urn` is treated as an **outage, not a success**: a title claiming a success it
+cannot name would break `provisions_provisioned_is_complete` anyway, "and would deserve to"
+(`src/titleclient.ts:151-155`).
+
+Two checks are made **before** the call rather than discovered from a 404: the scope must name a
+registered title, and that title must declare the capability. "A title that cannot do this is a
+catalogue mistake, and it deserves a row that says so" (`src/provisioning.ts:432-450`).
+
+Cosmetics and convenience items are delivered **here**, by writing an inventory row, and never
+routed through a title — routing them through one would make every cosmetic purchase depend on a
+game being up (`src/provisioning.ts:419-423`).
+
+---
+
+## A reward is a ledger posting with a budget cap
+
+`src/rewards.ts:1-40`. The service this supersedes increments XP, levels, skill points and `tokens`
+as plain integer columns in place — `work.tokens += locked.rewardTokens` — with **no entry anywhere
+and no possibility of reconciliation**. It survives only because those tokens are a dead currency.
+"The moment a reward is worth a Shard, and a Shard is one US cent funded by an on-chain deposit, an
+unreconciled increment is a hole in the money."
+
+There is also **no cap of any kind there**: no daily, weekly, seasonal or global issuance budget, no
+counter, no alert; `grantXp` loops levels with no ceiling. So a bug granting an objective twice per
+tick grants it for ever, bounded only by how long it takes somebody to notice.
+
+Here the budget is a column, the check is `seasons_within_budget`, and the increment happens in the
+**same transaction** as the grant — so it cannot be spent past by application-level cleverness, by a
+second replica, or by a hand-run UPDATE. The transaction simply fails to commit. **That is the
+difference between a control and an intention.**
+
+The ordering inside `grantReward` is the part easy to get backwards (`src/rewards.ts:29-39`):
+
+1. increment `rewards_granted_shards` **first**, under the CHECK — if the season cannot afford it
+   the transaction fails **before the ledger has been asked for anything**. Posting first and
+   capping second would move real money and then decline to record it;
+2. post to the ledger, inside the transaction, with a **derived** key;
+3. insert the `reward_grants` row naming the entry.
+
+A crash anywhere rolls all three back, and the retry **replays** the ledger entry rather than
+posting a second one. A crash between 2 and 3 is the dangerous one, and the derived key is what
+makes it safe.
+
+---
+
+## Routes
+
+Read out of `src/server.ts`. Everything domain is under `/v1`. `authenticate()` resolves the bearer
+token; scope is checked per-route and **only for service principals**, users being authorised by
+ownership (`/players/me`) or by the `admin` role.
+
+Four scopes: `worlds:read`, `worlds:write`, `worlds:title` and `worlds:admin`
+(`src/server.ts:102-107`).
+
+| Method | Path | Who | What it does |
+| --- | --- | --- | --- |
+| `GET` | `/livez` | **no auth** | liveness (`src/server.ts:363`) |
+| `GET` | `/readyz` | **no auth** | 200/503 (`src/server.ts:365`) |
+| `GET` | `/metrics` | **no auth** | Prometheus text (`src/server.ts:370`) |
+| `POST` | `/v1/events` | **no bearer token** — an **HMAC signature** | the bridge's front door. See below (`src/server.ts:389`) |
+| `GET` | `/v1/titles` | **no auth** | the registry. **Public deliberately: a launcher listing games cannot require a token to do it** (`src/server.ts:467`, note at `:466`) |
+| `POST` | `/v1/titles` | admin; service needs `worlds:admin` | registers a title with its `service_url`, capabilities and asset scopes (`src/server.ts:484`) |
+| `GET` | `/v1/players/me` | user; service needs `worlds:read` | the cross-title profile (`src/server.ts:524`) |
+| `PUT` | `/v1/players/me` | user; service needs `worlds:write` | updates it (`src/server.ts:551`) |
+| `PUT` | `/v1/players/me/cosmetics` | user; service needs `worlds:write` | equips cosmetics (`src/server.ts:576`) |
+| `GET` | `/v1/players/me/inventory` | user; service needs `worlds:read` | the inventory (`src/server.ts:598`) |
+| `POST` | `/v1/players/me/inventory/:id/list` | user; service needs `worlds:write` | lists an item for sale — **refused by the schema if the item is bound** (`src/server.ts:617`) |
+| `DELETE` | `/v1/players/me/inventory/:id/list` | user; service needs `worlds:write` | delists it (`src/server.ts:631`) |
+| `GET` | `/v1/provisions` | user (own) or admin; service needs `worlds:read` | **the operator view of failed rentals** — `?state=failed` (`src/server.ts:642`) |
+| `GET` | `/v1/provisions/:id` | user (own) or admin; service needs `worlds:read` | one provision (`src/server.ts:683`) |
+| `POST` | `/v1/provisions/:id/retry` | admin; service needs `worlds:admin` | re-opens a `failed` or `unsupported` row (`src/server.ts:667`, guarded at `src/provisioning.ts:673`) |
+| `GET` | `/v1/titles/:id/achievements` | **no auth** | the title's achievement catalogue (`src/server.ts:701`) |
+| `PUT` | `/v1/titles/:id/achievements` | service with `worlds:title` | a title declares its achievements (`src/server.ts:714`) |
+| `POST` | `/v1/titles/:id/achievements/unlock` | service with `worlds:title` | a title reports an unlock (`src/server.ts:735`) |
+| `GET` | `/v1/titles/:id/seasons` | **no auth** | the seasons (`src/server.ts:755`) |
+| `POST` | `/v1/titles/:id/seasons` | admin; service needs `worlds:admin` | opens a season **with a budget** (`src/server.ts:760`) |
+| `GET` | `/v1/seasons/:id/budget` | user or admin; service needs `worlds:read` | budget and consumption (`src/server.ts:779`) |
+| `POST` | `/v1/seasons/:id/rewards` | service with `worlds:title` | grants a reward — a ledger posting under the cap (`src/server.ts:802`) |
+
+**Six routes make no `authenticate()` call**: `/livez`, `/readyz`, `/metrics`, `GET /v1/titles`,
+`GET /v1/titles/:id/achievements` and `GET /v1/titles/:id/seasons`. A client that sends a token to
+one of them is not refused — the token is simply never looked at.
+
+**`POST /v1/events` is the seventh, and it is different.** It takes no bearer token at all; it is
+authenticated by an **HMAC signature over the raw bytes**, checked *before* the body is parsed
+(`src/server.ts:389-398`). The header explains why the raw bytes: parsing first would make the
+signature cover a re-serialisation rather than what arrived, and would run a parser for an
+unauthenticated caller (`src/server.ts:15`). A bad signature is **401, not 403** — the caller failed
+to authenticate at all — and the message says nothing about which half was wrong
+(`src/server.ts:394-397`).
+
+An event on a topic this service does not subscribe to is **accepted and ignored with a 202**, never
+a 4xx: a 4xx would make the producer's relay retry, for ever, an event it is correct to send and we
+are correct not to act on (`src/server.ts:418-423`).
+
+No route on this service takes an `Idempotency-Key`. The bridge's idempotency is the entitlement id,
+carried into `provisions_entitlement_uniq` and out again as the title's key
+(`src/titleclient.ts:144-147` — **both** in the header, which is what makes the POST retriable at
+all since `HttpClient` attempts a non-idempotent method exactly once without one, **and** in the
+body, which is what the title stores and dedupes on).
+
+---
+
+## Background work
+
+Leased jobs only. **A key is not a lock across kinds** (`src/jobs.ts:28`).
+
+| Job | Lease key | Cadence | What two replicas do |
+| --- | --- | --- | --- |
+| `outbox.relay` | `stream` | 1s | one claims the stream (`src/jobs.ts:59`) |
+| `provision.deliver` | `title:<id>` | on demand | one delivers per title. Row-level claiming inside `claimProvision` is what makes two deliveries of one provision impossible; the key bounds concurrent load on a single title service (`src/jobs.ts:134`, key at `src/server.ts:442`) |
+| `provision.sweep` | `stream` | 5s | finds outstanding provisions and enqueues them, so a provision left behind by a lost event or a paused deployment is picked up without anybody asking (`src/jobs.ts:60`, `:148-157`) |
+
+The sweep is what makes `WORLDS_PROVISIONING_ENABLED=false` safe: nothing is lost while it is off —
+the `provisions` rows sit `pending` and the sweep drains them when it is turned back on
+(`.env.example:50-52`).
+
+`provisions_outstanding_idx` is partial on `state in ('pending','provisioning')`, so the sweep's
+scan is the size of the backlog rather than the size of every rental ever sold
+(`src/migrations.ts:282-284`).
+
+---
+
+## The database
+
+`titles`, `player_profiles`, `inventory_items`, `provisions`, `achievements`,
+`player_achievements`, `seasons`, `reward_grants`, plus `jobs`/`outbox`/`inbox`.
+
+| Constraint | Refuses | Why it is here rather than in a handler |
+| --- | --- | --- |
+| `inventory_items_bound_not_listed` — `not (bound and listed_at is not null)` | selling anything that confers power | **the anti-pay-to-win control.** A rule in a route is a rule the next route forgets — and the frozen estate relies on three independent *conventions* instead: a catalogue policy, a trade engine that happens to be type-closed over resources, and the fact that entitlements have no transfer path. **Every one of those is a property of what has not been built yet** (`src/migrations.ts:206`, reasoning at `:196-205`) |
+| `seasons_within_budget` — `rewards_granted_shards <= reward_budget_shards` | minting rewards past the season's budget | **rewards are ledger postings, so a game exploit that mints them is a money incident rather than a balance complaint.** Enforced by the database, in the same transaction as the grant, so no application-level cleverness, no second replica and no hand-run UPDATE can spend past it (`src/migrations.ts:339-341`, reasoning at `:324-330`) |
+| `provisions_entitlement_uniq` on `entitlement_id` | provisioning one entitlement twice | **the idempotency of the whole bridge**: one entitlement provisions one thing, for ever, however many times the event is redelivered and however many replicas consume it (`src/migrations.ts:267`, reasoning at `:235-240`) |
+| `provisions.title_id` has **NO foreign key** | — | **deliberate, and found by a test.** A FK made the INSERT fail with 23503 → the webhook answered 500 → billing's relay redelivered for ever → **and the purchase was never recorded at all.** That is exactly the class of defect this table exists to end: a customer's money moves and nothing in the platform knows. Recording a purchase must never depend on the registry being up to date; an unregistered title becomes an `unsupported` row an operator can read and act on (`src/migrations.ts:243-253`, behaviour at `src/provisioning.ts:433-440`) |
+| `provisions_provisioned_is_complete` | `state = 'provisioned'` with no `provisioned_urn` | **a row that claims delivery and cannot say of what is exactly the state the frozen estate leaves a customer in** (`src/migrations.ts:276-278`) |
+| `provisions_failed_says_why` | `state = 'failed'` with no `last_error` | the first question after a failed rental is why (`src/migrations.ts:279`) |
+| `titles_slug_shape` — `slug ~ '^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$'` | a slug that is a path traversal or an over-matching scope | **a slug is a URL segment *and* an entitlement scope id**, so it is constrained where both uses read it (`src/migrations.ts:133`, reasoning at `:131-132`) |
+| `inventory_items_scope_shape` — `'*'` or a uuid | an arbitrary title scope | `*` is `CROSS_TITLE`; anything else must be a real title id (`src/migrations.ts:192-194`) |
+| `inventory_items_listing_complete` — `(listed_at is null) = (listing_urn is null)` | a half-recorded listing | "listed" is two columns and one fact (`src/migrations.ts:208-210`) |
+| `inventory_items_entitlement_uniq`, **partial** `where entitlement_id is not null` | one entitlement granting an item twice | partial, because most items have no entitlement behind them (`src/migrations.ts:221-223`) |
+| `reward_grants_key_uniq` on `idempotency_key` | a doubled reward | pairs with the derived ledger key so a retry replays rather than posts again (`src/migrations.ts:357`) |
+| `seasons_dates_ordered`, `seasons_budget_positive`, `achievements_points_sane` (0–1000) | inverted seasons, a zero budget, absurd point values | (`src/migrations.ts:337`, `:338`, `:304`) |
+
+---
+
+## Configuration
+
+`.env.example` and `src/env.ts` were cross-checked and **agree**: every variable `loadEnv` reads is
+present with its real default, and nothing extra is declared. `OUTBOX_SIGNING_SECRET` and
+`WORLDS_SERVICE_TOKEN` ship **empty**, so a copied file refuses to boot until they are filled —
+which is the fail-closed pattern, unlike the estate repositories that ship a long placeholder that
+clears the length check.
+
+| Variable | Default | If it is wrong or missing |
+| --- | --- | --- |
+| `PORT` | `4000` | integer 1–65535 (`src/env.ts:171`) |
+| `NODE_ENV` | `development` | labelling only (`src/env.ts:172`) |
+| `LOG_LEVEL` | `info` | outside the four levels, boot fails (`src/env.ts:159`) |
+| `CLOUDSFORGE_TAG` | `dev` | the reported version is wrong (`src/env.ts:173`) |
+| `WORLDS_DATABASE_URL` | — | **required** (`src/env.ts:175`). Rule 1 |
+| `WORLDS_DATABASE_POOL_MAX` | `10` | 1–100 (`src/env.ts:176`) |
+| `IDENTITY_JWKS_URL` | — | **required**; unreachable → 503, never 401 (`src/env.ts:177`) |
+| `IDENTITY_ISSUER` | — | **required**; wrong → universal 401 (`src/env.ts:178`) |
+| `OUTBOX_SIGNING_SECRET` | — | **required, ≥24 chars.** It signs outbound events **and** is what `POST /v1/events` verifies inbound signatures against, so a mismatch with billing's value makes every grant event 401 and **no world is ever provisioned** (`src/env.ts:179`, use at `src/server.ts:391-393`) |
+| `INSTANCE_ID` | hostname | names this replica in `jobs.locked_by` **and in `provisions.lease_owner`** (`src/env.ts:180`) |
+| `LEDGER_URL` | — | **required**. No posting, no reward (`src/env.ts:182`) |
+| `BILLING_URL` | — | **required**. Where `GET /internal/entitlements/:userId` is asked (`src/env.ts:183`) |
+| `WORLDS_SERVICE_TOKEN` | — | **required, ≥24 chars.** Carries `ledger:post` and `billing:read` (`src/env.ts:184`) |
+| `WORLDS_UPSTREAM_DEADLINE_MS` | `5000` | 100–60000, for ledger and billing (`src/env.ts:185`) |
+| `WORLDS_TITLE_DEADLINE_MS` | `20000` | 100–120000, **longer than the estate's other upstream deadlines deliberately**: provisioning a world writes up to four thousand tile rows in the title service, and a deadline shorter than that work **turns every provision into a retry of something that succeeded** (`src/env.ts:189`, reasoning at `:186-188`) |
+| `WORLDS_PROVISIONING_ENABLED` | `true` | set `false` to pause provisioning without pausing the service. Nothing is lost: rows sit `pending` and the sweep drains them (`src/env.ts:191`) |
+| `WORLDS_SEASON_REWARD_BUDGET_SHARDS` | `100000` | the budget a new season opens with when nobody names one. **A money control, not a tuning knob** — and deliberately small, because *a budget nobody chose should bind long before it costs anything*. Must be positive or boot fails (`src/env.ts:163-167`, `.env.example:55-61`) |
+| `WORLDS_TEST_DATABASE_URL` | — | tests only; the name must contain `test` |
+
+---
+
+## What it talks to
+
+| Upstream | Routes called | Verified against | When it is down |
+| --- | --- | --- | --- |
+| `micro-ledger` | `POST /entries` (`src/ledgerclient.ts:162`) | `ledger/src/server.ts:346` ✅ | **fail closed, inside the reward transaction.** The budget increment happens first, under the CHECK, and the posting happens in the same transaction — so a ledger outage rolls all three steps back: no reward, no budget consumed, no orphaned entry |
+| `micro-billing` | `GET /internal/entitlements/:userId` (`src/billingclient.ts:94`) | `billing/src/server.ts:505` ✅ | fail closed for an entitlement check; the bridge does not depend on it for the event path |
+| each registered **title service** | `GET /v1/title`, `POST /v1/provision` at that title's `service_url` (`src/titleclient.ts:122`, `:135`) | **❌ no title in the estate implements either** — see Known gaps | three-way: unsupported → terminal, refused → failed, unavailable → **retry with the same entitlement id** |
+| `micro-billing` (inbound) | it POSTs `billing.entitlement.granted` to `/v1/events` here | `billing/src/entitlements.ts:39` ✅ | if billing is down no grants arrive; the sweep has nothing to find, and no state is lost |
+
+---
+
+## Running it
+
+```bash
+pnpm install
+pnpm typecheck
+
+# Migrations are a one-shot job and are NEVER run by the service process.
+WORLDS_DATABASE_URL=postgres://worlds:worlds@127.0.0.1:55437/worlds pnpm migrate
+pnpm start
+```
+
+The suite needs a real Postgres whose database name contains `test`:
+
+```bash
+docker run -d --rm --name worlds-pg \
+  -e POSTGRES_USER=worlds -e POSTGRES_PASSWORD=worlds -e POSTGRES_DB=worlds_test \
+  -p 55437:5432 postgres:17-alpine
+
+WORLDS_TEST_DATABASE_URL=postgres://worlds:worlds@127.0.0.1:55437/worlds_test pnpm test
+```
+
+**119 `test(` declarations**, `node:test` only. Note that `fakeTitleService` is **a real HTTP
+server**, not a stubbed client (`src/testsupport.ts:4`, `:69`) — so the bridge is exercised over a
+socket, including the signature check, the idempotency header and the three failure mappings. The
+`title_id`-without-a-foreign-key decision above was found by `provisioning.test.ts`
+(`src/migrations.ts:252`).
+
+CI is the estate's reusable `service-ci.yml` and fails the build if the database-backed suite
+skipped.
+
+---
+
+## Known gaps
+
+* **No title implements the provisioning contract, so no private world has actually been created.**
+  `src/titleclient.ts` calls `GET /v1/title` (`:122`) and `POST /v1/provision` (`:135`) at a
+  registered title's `service_url`. Neither route exists in `micro-emberkin`
+  (`emberkin/src/server.ts:238-431`, ten routes, none of them these) nor in `micro-nda`
+  (`nda/src/server.ts`). Those two titles integrate with this service in the **other** direction
+  only — posting achievements with `worlds:write` (`emberkin/src/worldsclient.ts:15`,
+  `nda/src/rules.ts:35` declares `TITLE_SLUG = 'nda'`).
+
+  **This is the bridge working as designed rather than failing silently**, and the difference
+  matters: `driveProvision` checks the capability **before** it calls, so a title registered without
+  the `private_world` capability produces a terminal `unsupported` row naming the title and the
+  capability (`src/provisioning.ts:441-450`), not a blind 404. The machinery, the idempotency, the
+  operator view and the refund-starting event are all in place and tested against a real fake title
+  service. **What is absent is a title that answers.** Until one does, a private-world entitlement
+  ends as a readable `unsupported` row rather than as a world — which is a very large improvement on
+  a customer being charged repeatedly for something nothing records, and is still not delivery.
+* **Nothing in this repository registers a title.** `titles` is populated by an admin
+  `POST /v1/titles` (`src/server.ts:484`); there is no seed migration and no registration script, so
+  a fresh deployment has an empty registry and every provision lands `unsupported` with
+  "does not name a registered title" (`src/provisioning.ts:436`).
+* **`/metrics` is unauthenticated** (`src/server.ts:370`).
+* **The refund is an event, not an action.** `worlds.provision.failed` names the entitlement and
+  billing owns revocation (`src/provisioning.ts:35-36`); nothing here verifies that the refund
+  happened, so a failed rental's money is reconciled by billing or not at all.
+* **No OpenAPI description**, estate-wide (`docs/ecosystem/18-build-status.md` §3.3d, item 1).
