@@ -349,7 +349,7 @@ export function grantedEnvelope(
     key: overrides.entitlementId ?? 'ent-1',
     occurredAt: '2026-01-01T00:00:00.000Z',
     producer: 'billing',
-    version: 1,
+    version: '1.0',
     actor: `user:${ALICE}`,
     correlationId: 'req-1',
     payload: {

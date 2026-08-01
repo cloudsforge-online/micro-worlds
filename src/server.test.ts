@@ -142,7 +142,7 @@ async function postEvent(
   const signature = options.signature ?? signEvent(raw, options.secret ?? SECRET)
   const response = await fetch(`${baseUrl}/v1/events`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-cloudsforge-signature': signature },
+    headers: { 'content-type': 'application/json', 'cf-signature': signature },
     body: raw,
   })
   const text = await response.text()

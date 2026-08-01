@@ -49,7 +49,7 @@ import {
 import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { JobQueue } from '@cloudsforge/jobs'
-import { signEvent, type Db } from './outbox.ts'
+import { SIGNATURE_HEADER, signEvent, type Db } from './outbox.ts'
 import {
   isCapability,
   listTitles,
@@ -158,7 +158,6 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
 
 const SAFE_REQUEST_ID = /^[A-Za-z0-9_-]{1,64}$/
 const MAX_BODY_BYTES = 256 * 1024
-const SIGNATURE_HEADER = 'x-cloudsforge-signature'
 const UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
 
 interface Reply {
