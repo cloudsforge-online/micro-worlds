@@ -143,10 +143,10 @@ Four scopes: `worlds:read`, `worlds:write`, `worlds:title` and `worlds:admin`
 | `GET` | `/v1/titles/:id/achievements` | **no auth** | the title's achievement catalogue (`src/server.ts:701`) |
 | `PUT` | `/v1/titles/:id/achievements` | service with `worlds:title` | a title declares its achievements (`src/server.ts:714`) |
 | `POST` | `/v1/titles/:id/achievements/unlock` | service with `worlds:title` | a title reports an unlock (`src/server.ts:735`) |
-| `GET` | `/v1/titles/:id/seasons` | **no auth** | the seasons (`src/server.ts:755`) |
-| `POST` | `/v1/titles/:id/seasons` | admin; service needs `worlds:admin` | opens a season **with a budget** (`src/server.ts:760`) |
-| `GET` | `/v1/seasons/:id/budget` | user or admin; service needs `worlds:read` | budget and consumption (`src/server.ts:779`) |
-| `POST` | `/v1/seasons/:id/rewards` | service with `worlds:title` | grants a reward — a ledger posting under the cap (`src/server.ts:802`) |
+| `GET` | `/v1/titles/:id/seasons` | **no auth** | the seasons (`src/server.ts:795`) |
+| `POST` | `/v1/titles/:id/seasons` | admin; service needs `worlds:admin` | opens a season **with a budget**, or re-opens the one with that slug. The budget is a spending limit on `engagement:worlds`, so **lowering it is free and raising it needs `budgetRaiseApprovalId`** — a raise without one is `422 budget_raise_needs_approval` (`src/server.ts:800`) |
+| `GET` | `/v1/seasons/:id/budget` | user or admin; service needs `worlds:read` | budget and consumption (`src/server.ts:824`) |
+| `POST` | `/v1/seasons/:id/rewards` | service with `worlds:title` | grants a reward — a ledger posting under the cap (`src/server.ts:847`) |
 
 **Six routes make no `authenticate()` call**: `/livez`, `/readyz`, `/metrics`, `GET /v1/titles`,
 `GET /v1/titles/:id/achievements` and `GET /v1/titles/:id/seasons`. A client that sends a token to
@@ -210,6 +210,7 @@ scan is the size of the backlog rather than the size of every rental ever sold
 | `inventory_items_listing_complete` — `(listed_at is null) = (listing_urn is null)` | a half-recorded listing | "listed" is two columns and one fact (`src/migrations.ts:208-210`) |
 | `inventory_items_entitlement_uniq`, **partial** `where entitlement_id is not null` | one entitlement granting an item twice | partial, because most items have no entitlement behind them (`src/migrations.ts:221-223`) |
 | `reward_grants_key_uniq` on `idempotency_key` | a doubled reward | pairs with the derived ledger key so a retry replays rather than posts again (`src/migrations.ts:357`) |
+| `seasons_budget_raise_needs_approval` (trigger) + `seasons_budget_raise_approval_uniq` | **raising** a season's reward budget without naming a fresh approval — including by re-opening the season, and including a hand-run `UPDATE` | since migration 9 a season is funded from `engagement:worlds`, so `reward_budget_shards` is a **spending limit on real platform money**. `docs/ecosystem/21-engagement-treasury.md` §6 makes raising an engagement cap an approved act and lowering one free; §7.7 requires that asymmetry be proven by test; `admin-api/src/migrations.ts:512` already enforces it on `engagement_policies`. `openSeason`'s ON CONFLICT branch used to assign the budget unconditionally, so the ordinary re-open — the one that corrects a name — silently raised the cap. **A trigger and not a CHECK** because the rule is about the *direction* of a change and a CHECK cannot see the old row. The approval id is `text` with no FK: `approvals` is admin-api's table, so this is a cross-service reference like `reward_grants.journal_entry_id` (`src/migrations.ts:482`, uniqueness at `:455`, reasoning at `:407-448` — including what it does **not** cover) |
 | `seasons_dates_ordered`, `seasons_budget_positive`, `achievements_points_sane` (0–1000) | inverted seasons, a zero budget, absurd point values | (`src/migrations.ts:337`, `:338`, `:304`) |
 
 ---

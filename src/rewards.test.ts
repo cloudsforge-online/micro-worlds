@@ -10,12 +10,15 @@ import test, { after, before, beforeEach } from 'node:test'
 import type postgres from 'postgres'
 import {
   BudgetExceededError,
+  BudgetRaiseNeedsApprovalError,
   defineAchievement,
+  findSeason,
   grantReward,
   listUnlocked,
   openSeason,
   seasonBudget,
   unlockAchievement,
+  type Season,
 } from './rewards.ts'
 import { registerTitle } from './titles.ts'
 import { LedgerUnavailableError } from './ledgerclient.ts'
@@ -438,4 +441,111 @@ test('a budget cannot be lowered below what has already been paid', { skip }, as
       }),
     /seasons_within_budget/,
   )
+})
+
+/* ------------------------------------------------------------- raising a spending limit */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THESE FOUR REPLACE AN EXPECTATION THAT WAS WRONG, AND THE REASON IT WAS WRONG IS DATED.**
+ *
+ * `openSeason` used to assign `reward_budget_shards = excluded.reward_budget_shards` in its ON
+ * CONFLICT branch with no condition, and the comment on that line defended it: "the budget may be
+ * RAISED by re-opening, never lowered below what has already been paid". That was a defensible
+ * sentence while the budget was a game-balance number.
+ *
+ * Migration 9 ended that. A season is funded from `engagement:worlds`, rewards debit that account,
+ * and `reward_budget_shards` is now a **spending limit on real platform money**. Doc 21 is
+ * explicit about what that makes it: §6 lists `engagement.policy.set` as "required to raise, not
+ * to lower", §7.7 requires the asymmetry to be proven by test, and
+ * `admin-api/src/migrations.ts:512` already enforces it on `engagement_policies`. A re-open that
+ * raised the cap with no approval and no record contradicted all three — and did it through the
+ * same call an operator makes to correct a season's name.
+ *
+ * So the expectation changed deliberately: **a re-open that raises the budget is now refused
+ * unless it names an approval, and a re-open that lowers it still succeeds without one.** Both
+ * halves are asserted, because a guard that refused every change would be just as wrong in the
+ * other direction and would be exactly as green.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/** The re-open an operator does: same title, same slug, whatever budget is passed. */
+async function reopen(
+  titleId: string,
+  rewardBudgetShards: bigint,
+  budgetRaiseApprovalId?: string,
+): Promise<Season> {
+  return openSeason(db, {
+    titleId,
+    slug: 's1',
+    name: 'Season One, renamed',
+    startsAt: new Date('2026-01-01T00:00:00Z'),
+    endsAt: new Date('2026-05-01T00:00:00Z'),
+    rewardBudgetShards,
+    ...(budgetRaiseApprovalId === undefined ? {} : { budgetRaiseApprovalId }),
+  })
+}
+
+async function titleOf(seasonId: string): Promise<string> {
+  const rows = await sql<{ title_id: string }[]>`select title_id from seasons where id = ${seasonId}`
+  return rows[0]!.title_id
+}
+
+test('a re-open cannot SILENTLY raise the budget — that is a spending limit', { skip }, async () => {
+  const seasonId = await aSeason(1_000n)
+  const titleId = await titleOf(seasonId)
+
+  await assert.rejects(
+    () => reopen(titleId, 50_000n),
+    (err: unknown) => err instanceof BudgetRaiseNeedsApprovalError,
+    'raising an engagement cap without an approval must be refused (21 §6, §7.7)',
+  )
+
+  // And nothing moved. A refusal that half-applied would be worse than the raise it refused.
+  const after = await findSeason(db, seasonId)
+  assert.equal(after?.rewardBudgetShards, 1_000n)
+  assert.equal(after?.name, 'Season One', 'the whole upsert rolled back, name included')
+  assert.equal(after?.budgetRaiseApprovalId, null)
+})
+
+test('a re-open MAY lower the budget, and needs nobody to say so', { skip }, async () => {
+  // The other half of 21 §7.7, and the half that stops this guard from being a blanket refusal:
+  // spending LESS of the treasury's money must never need a meeting. Still floored by
+  // seasons_within_budget, which the test above this block proves separately.
+  const seasonId = await aSeason(1_000n)
+  const lowered = await reopen(await titleOf(seasonId), 400n)
+  assert.equal(lowered.rewardBudgetShards, 400n)
+  assert.equal(lowered.name, 'Season One, renamed', 'the rest of the re-open still applies')
+  assert.equal(lowered.budgetRaiseApprovalId, null, 'lowering names nobody, so nobody is recorded')
+})
+
+test('a raise with an approval lands, and the row says what authorised it', { skip }, async () => {
+  const seasonId = await aSeason(1_000n)
+  const titleId = await titleOf(seasonId)
+
+  const raised = await reopen(titleId, 50_000n, 'approval-9f3c')
+  assert.equal(raised.rewardBudgetShards, 50_000n)
+  assert.equal(raised.budgetRaiseApprovalId, 'approval-9f3c')
+
+  // Spent. One approval is one raise — otherwise the first approved raise would be a standing
+  // licence, which is precisely the silent raise this replaced, one round trip later.
+  await assert.rejects(
+    () => reopen(titleId, 90_000n, 'approval-9f3c'),
+    (err: unknown) => err instanceof BudgetRaiseNeedsApprovalError,
+  )
+  await assert.rejects(
+    () => reopen(titleId, 90_000n),
+    (err: unknown) => err instanceof BudgetRaiseNeedsApprovalError,
+  )
+  assert.equal((await findSeason(db, seasonId))?.rewardBudgetShards, 50_000n)
+})
+
+test('the ordinary re-open — same budget, new name — still just works', { skip }, async () => {
+  // The case the old code was really written for. It must keep working, or the fix has moved the
+  // cost from a money bug to an operator who cannot correct a typo.
+  const seasonId = await aSeason(1_000n)
+  const same = await reopen(await titleOf(seasonId), 1_000n)
+  assert.equal(same.id, seasonId, 're-opening updates the season rather than making a second one')
+  assert.equal(same.name, 'Season One, renamed')
+  assert.equal(same.rewardBudgetShards, 1_000n)
 })

@@ -171,6 +171,85 @@ test('seasons_within_budget: a season cannot be spent past, by anybody', { skip 
   assert.equal(after[0]?.rewards_granted_shards, '1000')
 })
 
+/**
+ * **RAISING A SPENDING LIMIT NEEDS AN APPROVAL; LOWERING ONE DOES NOT.** 21 §7.7, fire-tested.
+ *
+ * Since migration 9 a season is funded from `engagement:worlds` and its rewards debit that
+ * account, so `reward_budget_shards` is a spending limit on real platform money rather than a
+ * game-balance number. 21 §6 makes raising an engagement cap an approved act and lowering one
+ * free, and `admin-api/src/migrations.ts:512` already enforces that asymmetry on
+ * `engagement_policies` with a trigger of its own.
+ *
+ * This asserts against raw SQL on purpose. `openSeason` translates the refusal into a decent
+ * error, but the control has to survive the hand-run UPDATE at three in the morning and the
+ * second replica — the same standard `seasons_within_budget` is held to directly above.
+ */
+test('seasons_budget_raise_needs_approval: a raise needs one, a cut does not', { skip }, async () => {
+  const titleId = await aTitle()
+  const rows = await sql<{ id: string }[]>`
+    insert into seasons (title_id, slug, name, starts_at, ends_at, reward_budget_shards)
+    values (${titleId}, 's1', 'Season One', now(), now() + interval '90 days', 1000)
+    returning id
+  `
+  const id = rows[0]!.id
+
+  // 1. A bare raise is refused, however it arrives.
+  await assert.rejects(
+    () => sql`update seasons set reward_budget_shards = 5000 where id = ${id}`,
+    /seasons_budget_raise_needs_approval/,
+  )
+
+  // 2. A cut lands with nothing named. This is the half the asymmetry exists for: an operator who
+  //    wants to spend LESS of the treasury's money must never need a meeting to do it.
+  await sql`update seasons set reward_budget_shards = 800 where id = ${id}`
+
+  // 3. A raise that names an approval lands, and the row records what authorised it.
+  await sql`
+    update seasons set reward_budget_shards = 5000, budget_raise_approval_id = 'approval-a'
+     where id = ${id}
+  `
+  const raised = await sql<{ reward_budget_shards: string; budget_raise_approval_id: string }[]>`
+    select reward_budget_shards, budget_raise_approval_id from seasons where id = ${id}
+  `
+  assert.equal(raised[0]?.reward_budget_shards, '5000')
+  assert.equal(raised[0]?.budget_raise_approval_id, 'approval-a')
+
+  // 4. That approval is spent. Re-presenting it, or presenting nothing, raises nothing further —
+  //    otherwise one approval would be a standing licence to raise the cap for ever.
+  await assert.rejects(
+    () => sql`update seasons set reward_budget_shards = 9000 where id = ${id}`,
+    /seasons_budget_raise_needs_approval/,
+  )
+  await assert.rejects(
+    () => sql`
+      update seasons set reward_budget_shards = 9000, budget_raise_approval_id = 'approval-a'
+       where id = ${id}
+    `,
+    /seasons_budget_raise_needs_approval/,
+  )
+
+  // 5. Nor may it be spent on a DIFFERENT season. One approval, one raise, anywhere.
+  const other = await sql<{ id: string }[]>`
+    insert into seasons (title_id, slug, name, starts_at, ends_at, reward_budget_shards)
+    values (${titleId}, 's2', 'Season Two', now(), now() + interval '90 days', 100)
+    returning id
+  `
+  await assert.rejects(
+    () => sql`
+      update seasons set reward_budget_shards = 200, budget_raise_approval_id = 'approval-a'
+       where id = ${other[0]!.id}
+    `,
+    /seasons_budget_raise_approval_uniq/,
+  )
+
+  // 6. An update that is not about the budget needs no approval and cannot lose the one on record.
+  await sql`update seasons set status = 'active' where id = ${id}`
+  const untouched = await sql<{ budget_raise_approval_id: string }[]>`
+    select budget_raise_approval_id from seasons where id = ${id}
+  `
+  assert.equal(untouched[0]?.budget_raise_approval_id, 'approval-a')
+})
+
 test('a season needs a positive budget and an end after its start', { skip }, async () => {
   const titleId = await aTitle()
   await assert.rejects(

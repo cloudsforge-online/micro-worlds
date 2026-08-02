@@ -71,6 +71,28 @@ export class BudgetExceededError extends RewardError {
   }
 }
 
+/**
+ * A re-open tried to raise a season's reward budget without naming an approval.
+ *
+ * Not a fault either: the season's budget is a spending limit on `engagement:worlds`, and 21 §6
+ * makes raising one an approved act while leaving lowering free. The database is what refuses it
+ * (`seasons_budget_raise_needs_approval`, migration 10); this type exists so the refusal reaches a
+ * caller as a sentence about approvals rather than as a Postgres exception string.
+ */
+export class BudgetRaiseNeedsApprovalError extends RewardError {
+  readonly titleId: string
+  readonly slug: string
+  constructor(titleId: string, slug: string, requested: bigint) {
+    super(
+      `raising this season's reward budget to ${requested} shards needs an approved ` +
+        'engagement.policy.set approval id; lowering it does not (21 §7.7)',
+    )
+    this.name = 'BudgetRaiseNeedsApprovalError'
+    this.titleId = titleId
+    this.slug = slug
+  }
+}
+
 /* ------------------------------------------------------------------ achievements */
 
 export interface Achievement {
@@ -258,6 +280,14 @@ export interface Season {
   readonly status: SeasonStatus
   readonly rewardBudgetShards: bigint
   readonly rewardsGrantedShards: bigint
+  /**
+   * The approval that authorised the CURRENT budget, or null if it has never been raised.
+   *
+   * Exposed rather than hidden: a spending limit that was raised should be able to say what
+   * raised it, and 21 §4's whole premise is that the programme can be reconstructed after the
+   * fact by somebody who was not in the room.
+   */
+  readonly budgetRaiseApprovalId: string | null
 }
 
 interface SeasonRow {
@@ -270,11 +300,12 @@ interface SeasonRow {
   readonly status: string
   readonly reward_budget_shards: string
   readonly rewards_granted_shards: string
+  readonly budget_raise_approval_id: string | null
 }
 
 const SEASON_COLUMNS = `
   id, title_id, slug, name, starts_at, ends_at, status, reward_budget_shards,
-  rewards_granted_shards
+  rewards_granted_shards, budget_raise_approval_id
 `
 
 const toSeason = (row: SeasonRow): Season => ({
@@ -287,53 +318,113 @@ const toSeason = (row: SeasonRow): Season => ({
   status: row.status as SeasonStatus,
   rewardBudgetShards: BigInt(row.reward_budget_shards),
   rewardsGrantedShards: BigInt(row.rewards_granted_shards),
+  budgetRaiseApprovalId: row.budget_raise_approval_id,
 })
 
 /**
- * Open a season.
+ * Open a season, or re-open the one with this slug.
  *
  * A ROW, per title, with a start, an end and a budget. The frozen estate's "Season 1" is a single
  * hardcoded object in a shared package with no expiry and no title — so a second season means
  * editing and republishing that package, and anybody who bought season one owns season two.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **RE-OPENING MAY LOWER THE BUDGET FREELY AND MAY RAISE IT ONLY WITH AN APPROVAL.**
+ *
+ * `reward_budget_shards` stopped being a game-balance number in migration 9: the season is funded
+ * from `engagement:worlds`, rewards debit that account, so the budget is a **spending limit on
+ * real platform money**. This function used to assign `reward_budget_shards` unconditionally in
+ * its ON CONFLICT branch, which meant the ordinary act of re-opening a season to fix a name or
+ * push an end date silently raised that limit to whatever the request carried.
+ *
+ * Doc 21 §6 makes raising an engagement cap an approved act and lowering one free, §7.7 requires
+ * that asymmetry to be proven by test, and `admin-api/src/migrations.ts:512` already enforces it
+ * on `engagement_policies` with a trigger. This is the same rule about the same money, so it is
+ * the same mechanism: `seasons_budget_raise_needs_approval` refuses an increase that does not name
+ * a fresh approval, and it refuses it against a hand-run UPDATE as well as against this function.
+ *
+ * The guard is therefore NOT here. What is here is the translation of the database's refusal into
+ * `BudgetRaiseNeedsApprovalError`, and the plumbing of `budgetRaiseApprovalId` through to the row.
+ * A pre-flight SELECT would have been a lie twice over: it could not bind (two re-opens could read
+ * the same old budget and both raise), and it would have made a schema control look optional.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
-export async function openSeason(
-  sql: Db,
-  input: {
-    readonly titleId: string
-    readonly slug: string
-    readonly name: string
-    readonly startsAt: Date
-    readonly endsAt: Date
-    readonly rewardBudgetShards: bigint
-    readonly status?: SeasonStatus
-  },
-): Promise<Season> {
+export async function openSeason(sql: Db, input: OpenSeasonInput): Promise<Season> {
   if (input.rewardBudgetShards <= 0n) {
     throw new RewardError('a season needs a positive reward budget')
   }
-  const rows = await sql<SeasonRow[]>`
-    insert into seasons (
-      title_id, slug, name, starts_at, ends_at, status, reward_budget_shards
-    ) values (
-      ${input.titleId}, ${input.slug}, ${input.name}, ${input.startsAt.toISOString()}::timestamptz,
-      ${input.endsAt.toISOString()}::timestamptz, ${input.status ?? 'upcoming'},
-      ${input.rewardBudgetShards.toString()}::numeric
-    )
-    on conflict (title_id, slug) do update set
-      name = excluded.name,
-      starts_at = excluded.starts_at,
-      ends_at = excluded.ends_at,
-      status = excluded.status,
-      -- The budget may be RAISED by re-opening, never lowered below what has already been paid:
-      -- the seasons_within_budget CHECK refuses that, which is the right answer. Lowering a budget cannot
-      -- un-pay a reward.
-      reward_budget_shards = excluded.reward_budget_shards,
-      updated_at = now()
-    returning ${sql.unsafe(SEASON_COLUMNS)}
-  `
+  const rows = await upsertSeason(sql, input)
   const row = rows[0]
   if (!row) throw new Error('upsert returned no row')
   return toSeason(row)
+}
+
+export interface OpenSeasonInput {
+  readonly titleId: string
+  readonly slug: string
+  readonly name: string
+  readonly startsAt: Date
+  readonly endsAt: Date
+  readonly rewardBudgetShards: bigint
+  readonly status?: SeasonStatus
+  /**
+   * The `engagement.policy.set` approval authorising a RAISE, when this re-open raises the cap.
+   *
+   * A reference to a row `admin-api` owns — text and no foreign key, like
+   * `reward_grants.journal_entry_id` points at the ledger's. Omit it and a raise is refused; omit
+   * it and lower, and nothing is asked of anybody. One id authorises one raise, for ever.
+   */
+  readonly budgetRaiseApprovalId?: string
+}
+
+async function upsertSeason(sql: Db, input: OpenSeasonInput): Promise<SeasonRow[]> {
+  try {
+    return await sql<SeasonRow[]>`
+      insert into seasons (
+        title_id, slug, name, starts_at, ends_at, status, reward_budget_shards
+      ) values (
+        ${input.titleId}, ${input.slug}, ${input.name}, ${input.startsAt.toISOString()}::timestamptz,
+        ${input.endsAt.toISOString()}::timestamptz, ${input.status ?? 'upcoming'},
+        ${input.rewardBudgetShards.toString()}::numeric
+      )
+      on conflict (title_id, slug) do update set
+        name = excluded.name,
+        starts_at = excluded.starts_at,
+        ends_at = excluded.ends_at,
+        status = excluded.status,
+        -- Assigned, not guarded, here. LOWERING lands and is floored by seasons_within_budget,
+        -- which refuses a budget below what the season has already paid — lowering a budget cannot
+        -- un-pay a reward. RAISING reaches seasons_budget_raise_needs_approval, which refuses it
+        -- unless the line below carries a fresh approval id.
+        reward_budget_shards = excluded.reward_budget_shards,
+        -- coalesce, never excluded alone: a re-open that says nothing about approvals must not
+        -- blank the id that authorised the budget the season already has, or that id becomes
+        -- reusable. The trigger pins it back to its old value on any change that is not a raise.
+        budget_raise_approval_id = coalesce(
+          ${input.budgetRaiseApprovalId ?? null}, seasons.budget_raise_approval_id
+        ),
+        updated_at = now()
+      returning ${sql.unsafe(SEASON_COLUMNS)}
+    `
+  } catch (err: unknown) {
+    if (isRaiseWithoutApproval(err)) {
+      throw new BudgetRaiseNeedsApprovalError(input.titleId, input.slug, input.rewardBudgetShards)
+    }
+    throw err
+  }
+}
+
+/**
+ * The trigger's refusal, recognised by the name it raises under.
+ *
+ * Matched on the message rather than on the SQLSTATE alone because `check_violation` is also what
+ * `seasons_within_budget` and `seasons_budget_positive` raise, and those are different sentences a
+ * caller needs told differently. The name is the first token of the exception for exactly this.
+ */
+function isRaiseWithoutApproval(err: unknown): boolean {
+  return (
+    err instanceof Error && err.message.includes('seasons_budget_raise_needs_approval')
+  )
 }
 
 export async function findSeason(sql: Db, id: string): Promise<Season | null> {

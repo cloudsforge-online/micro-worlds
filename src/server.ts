@@ -82,6 +82,7 @@ import {
 import { PROVISION_KIND, provisionKey } from './jobs.ts'
 import {
   BudgetExceededError,
+  BudgetRaiseNeedsApprovalError,
   RewardError,
   defineAchievement,
   grantReward,
@@ -317,6 +318,16 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
         remaining: err.remaining.toString(),
       })
       return errorReply(422, 'budget_exceeded', err.message, ctx.requestId)
+    }
+    if (err instanceof BudgetRaiseNeedsApprovalError) {
+      // Its own code, and logged at error, because a silent raise of a spending limit is what this
+      // refusal exists to prevent — an operator who tried one should be able to find the attempt.
+      // 422 rather than 403: the caller's authority is not the problem, the missing approval is.
+      ctx.log.error('a season budget raise was refused for want of an approval', {
+        titleId: err.titleId,
+        slug: err.slug,
+      })
+      return errorReply(422, 'budget_raise_needs_approval', err.message, ctx.requestId)
     }
     if (err instanceof InventoryError) {
       return errorReply(409, 'inventory_state', err.message, ctx.requestId)
@@ -801,6 +812,11 @@ function buildRoutes(): Route[] {
         endsAt: new Date(requireString(body, 'endsAt')),
         rewardBudgetShards: readShards(body['rewardBudgetShards']),
         ...(typeof body['status'] === 'string' ? { status: body['status'] as 'active' } : {}),
+        // The approval that authorises a RAISE, when this call raises the cap. Absent, and a raise
+        // is refused by the database; present and already used, likewise. Lowering never needs it.
+        ...(typeof body['budgetRaiseApprovalId'] === 'string'
+          ? { budgetRaiseApprovalId: body['budgetRaiseApprovalId'] }
+          : {}),
       })
       return { status: 201, body: { season: toSeasonWire(season) } }
     }),
@@ -906,6 +922,7 @@ function toSeasonWire(season: {
   status: string
   rewardBudgetShards: bigint
   rewardsGrantedShards: bigint
+  budgetRaiseApprovalId: string | null
 }): Record<string, unknown> {
   return {
     id: season.id,
@@ -918,6 +935,9 @@ function toSeasonWire(season: {
     // Strings, always. A budget is money.
     rewardBudgetShards: season.rewardBudgetShards.toString(),
     rewardsGrantedShards: season.rewardsGrantedShards.toString(),
+    // Named, not hidden. A spending limit that was raised should say what raised it; 21 §4's
+    // premise is that the programme can be reconstructed by somebody who was not in the room.
+    budgetRaiseApprovalId: season.budgetRaiseApprovalId,
   }
 }
 

@@ -512,6 +512,66 @@ test('a shard amount sent as a JSON number is refused rather than rounded', { sk
   assert.equal(res.status, 400)
 })
 
+test('an ADMIN re-opening a season cannot raise its budget without an approval', { skip }, async () => {
+  // The route is the path an operator actually takes, and this is where the silent raise happened:
+  // POST the same slug with a bigger number and the cap on `engagement:worlds` moved. 21 §6 makes
+  // that an approved act; the refusal gets its own code so an operator is told which of the two
+  // money refusals this route can produce they have hit.
+  const title = await registerTitle(db, 'worlds', {
+    slug: 'ashfall',
+    name: 'Ashfall',
+    status: 'live',
+    serviceUrl: 'http://127.0.0.1:9001',
+    capabilities: ['seasons'],
+    assetScopes: [],
+    actor: 'operator:test',
+    correlationId: 'req-1',
+  })
+  const season = {
+    slug: 's1',
+    name: 'Season One',
+    startsAt: '2026-01-01T00:00:00Z',
+    endsAt: '2026-04-01T00:00:00Z',
+  }
+  const opened = await call(`/v1/titles/${title.id}/seasons`, {
+    method: 'POST',
+    token: 'svc-admin',
+    body: { ...season, rewardBudgetShards: '1000' },
+  })
+  assert.equal(opened.status, 201)
+
+  const raised = await call(`/v1/titles/${title.id}/seasons`, {
+    method: 'POST',
+    token: 'svc-admin',
+    body: { ...season, rewardBudgetShards: '1000000' },
+  })
+  assert.equal(raised.status, 422)
+  assert.equal((raised.body['error'] as Record<string, unknown>)['code'], 'budget_raise_needs_approval')
+
+  // Lowering, from the same caller with the same authority, goes straight through — the asymmetry
+  // is about the direction of the change and not about who is asking.
+  const lowered = await call(`/v1/titles/${title.id}/seasons`, {
+    method: 'POST',
+    token: 'svc-admin',
+    body: { ...season, rewardBudgetShards: '400' },
+  })
+  assert.equal(lowered.status, 201)
+  const body = lowered.body['season'] as Record<string, unknown>
+  assert.equal(body['rewardBudgetShards'], '400')
+  assert.equal(body['budgetRaiseApprovalId'], null)
+
+  // And a raise that names an approval lands, with the row saying what authorised it.
+  const approved = await call(`/v1/titles/${title.id}/seasons`, {
+    method: 'POST',
+    token: 'svc-admin',
+    body: { ...season, rewardBudgetShards: '1000000', budgetRaiseApprovalId: 'approval-4e1a' },
+  })
+  assert.equal(approved.status, 201)
+  const approvedBody = approved.body['season'] as Record<string, unknown>
+  assert.equal(approvedBody['rewardBudgetShards'], '1000000')
+  assert.equal(approvedBody['budgetRaiseApprovalId'], 'approval-4e1a')
+})
+
 /* ------------------------------------------------------------------ shape */
 
 test('a malformed id is a 404, not a 500 from Postgres', { skip }, async () => {

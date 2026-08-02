@@ -399,6 +399,91 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 10,
+    name: 'season_budget_raise_needs_approval',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      -- **RAISING A SPENDING LIMIT NEEDS AN APPROVAL. LOWERING ONE DOES NOT.** 21 §7.7.
+      --
+      -- Migration 9 made 'reward_budget_shards' a claim on real platform money: the season is
+      -- funded from 'engagement:worlds', and rewards debit that account. From that moment the
+      -- budget stopped being a game-balance number and became a SPENDING LIMIT.
+      --
+      -- 'openSeason' upserts on (title_id, slug), and its ON CONFLICT branch assigned
+      -- 'reward_budget_shards = excluded.reward_budget_shards' unconditionally. So re-opening a
+      -- season — the same call an operator makes to correct a name or push an end date — RAISED
+      -- the cap on engagement money to whatever the request happened to carry, with no approval
+      -- and no record that a raise had occurred. The old comment on that line argued only about
+      -- lowering, which 'seasons_within_budget' already refuses below what has been paid; the
+      -- direction that costs money was the one nobody guarded.
+      --
+      -- Doc 21 is unambiguous about the shape of the answer. §6 makes 'engagement.policy.set'
+      -- "required to raise, not to lower"; §7.7 requires that asymmetry be PROVEN by test; and
+      -- 'admin-api/src/migrations.ts:512' already enforces exactly it, in the database, with a
+      -- trigger that refuses an increase unless the row names a fresh approved
+      -- 'engagement.policy.set'. This is the same rule about the same pool of money, so it gets
+      -- the same mechanism rather than a second, weaker one.
+      --
+      -- **Why a trigger and not a CHECK.** A CHECK cannot see the previous row, and the rule is
+      -- about the DIRECTION of a change, not about a value. A BEFORE UPDATE trigger is the only
+      -- schema-level construct that can compare new to old — the same reasoning 21 §7.3 records
+      -- for the transfer cap, which also had to become a trigger once it needed a second row.
+      --
+      -- **Why the approval id is 'text' with no foreign key.** 'approvals' is admin-api's table
+      -- in admin-api's database; this estate has no shared schema. The column is a REFERENCE to a
+      -- row another service owns, exactly like 'reward_grants.journal_entry_id' points at the
+      -- ledger's. What this service can enforce alone, it enforces: a raise must NAME an
+      -- approval, and an approval id may authorise exactly one raise, ever, anywhere in this
+      -- database. Whether that id is genuinely approved is admin-api's fact to hold, and it holds
+      -- it with 'engagement_policies_raise_needs_approval'.
+      --
+      -- **What this does NOT cover, said plainly.** admin-api's trigger fires BEFORE INSERT OR
+      -- UPDATE; this one fires on UPDATE only. A season's INSERT is the creation of a cap rather
+      -- than the raising of one, it is already bounded by what has actually been transferred into
+      -- 'engagement:worlds' (the ledger's overdraft trigger refuses a reward the account cannot
+      -- fund), and requiring an approval to open a season at all would be a different decision
+      -- from this one. That leaves DELETE-then-INSERT as a theoretical route around the rule — but
+      -- deleting a season cascades its 'reward_grants' away, which destroys the record of every
+      -- reward it ever paid. That is not a silent raise; it is an obvious act with its own alarm.
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      alter table seasons add column if not exists budget_raise_approval_id text;
+
+      -- One approval, one raise, for ever. NULLs do not collide in a Postgres unique index, so
+      -- every season that has never been raised coexists happily.
+      alter table seasons drop constraint if exists seasons_budget_raise_approval_uniq;
+      alter table seasons add constraint seasons_budget_raise_approval_uniq
+        unique (budget_raise_approval_id);
+
+      create or replace function seasons_budget_raise_needs_approval() returns trigger
+      language plpgsql as $$
+      begin
+        -- Lowering, or leaving it alone, is free — and is floored by seasons_within_budget, which
+        -- still refuses a budget below what the season has already paid out. The approval id is
+        -- pinned back to its old value so that a call which does not raise cannot burn an
+        -- approval, and so the column always means "what authorised the CURRENT budget".
+        if new.reward_budget_shards <= old.reward_budget_shards then
+          new.budget_raise_approval_id := old.budget_raise_approval_id;
+          return new;
+        end if;
+
+        if new.budget_raise_approval_id is null
+           or new.budget_raise_approval_id is not distinct from old.budget_raise_approval_id then
+          raise exception
+            'seasons_budget_raise_needs_approval: raising a season reward budget from % to % requires a fresh approved engagement.policy.set approval; lowering does not (21 §7.7)',
+            old.reward_budget_shards, new.reward_budget_shards
+            using errcode = 'check_violation';
+        end if;
+        return new;
+      end;
+      $$;
+
+      drop trigger if exists seasons_budget_raise_needs_approval on seasons;
+      create trigger seasons_budget_raise_needs_approval
+        before update on seasons
+        for each row execute function seasons_budget_raise_needs_approval();
+    `,
+  },
 ]
 
 /**
