@@ -128,7 +128,7 @@ Four scopes: `worlds:read`, `worlds:write`, `worlds:title` and `worlds:admin`
 | `GET` | `/livez` | **no auth** | liveness (`src/server.ts:363`) |
 | `GET` | `/readyz` | **no auth** | 200/503 (`src/server.ts:365`) |
 | `GET` | `/metrics` | **no auth** | Prometheus text (`src/server.ts:370`) |
-| `POST` | `/v1/events` | **no bearer token** — an **HMAC signature** | the bridge's front door. See below (`src/server.ts:389`) |
+| `POST` | `/v1/events` | **no bearer token** — an **HMAC signature** | the bridge's front door, now serving TWO topics: `billing.entitlement.granted` (provisioning) and `aetherholm.season.sealed` (heraldry — `src/heraldry.ts`, dispatch in `src/server.ts`). Everything else is acknowledged and ignored |
 | `GET` | `/v1/titles` | **no auth** | the registry. **Public deliberately: a launcher listing games cannot require a token to do it** (`src/server.ts:467`, note at `:466`) |
 | `POST` | `/v1/titles` | admin; service needs `worlds:admin` | registers a title with its `service_url`, capabilities and asset scopes (`src/server.ts:484`) |
 | `GET` | `/v1/players/me` | user; service needs `worlds:read` | the cross-title profile (`src/server.ts:524`) |
@@ -315,3 +315,20 @@ skipped.
   billing owns revocation (`src/provisioning.ts:35-36`); nothing here verifies that the refund
   happened, so a failed rental's money is reconciled by billing or not at all.
 * **No OpenAPI description**, estate-wide (`docs/ecosystem/18-build-status.md` §3.3d, item 1).
+
+## Heraldry — the entitlement bridge finally carries something across titles
+
+A sealed Aetherholm season POSTs `aetherholm.season.sealed` here, and every victor member receives
+a ranked banner on the shared profile: `cf:aetherholm:heraldry:<seasonId>:rank:<n>`, cross-title
+(`title_scope '*'`), source `reward`, and **bound — a victory cannot be sold**, enforced by the
+`inventory_items_bound_not_listed` CHECK rather than by anybody's restraint.
+
+The dedupe is layered and each layer is load-bearing: the inbox row makes a redelivered seal a
+no-op as a whole; the synthetic per-user entitlement id
+(`aetherholm:season:<seasonId>:user:<userId>`) makes each member's grant individually idempotent
+under the `(entitlement_id, item_urn)` unique index — **per user**, because one season-wide id
+would let exactly one alliance member win the insert and hand every other member a silent null.
+Grants, inbox claim and the `worlds.inventory.granted` outbox rows commit or vanish together
+(`handleSeasonSealed`, `src/heraldry.ts`).
+
+This closes the gap `18-build-status` §3.3p recorded as "an event with no consumer yet".

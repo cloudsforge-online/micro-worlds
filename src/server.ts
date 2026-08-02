@@ -49,6 +49,7 @@ import {
 import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { JobQueue } from '@cloudsforge/jobs'
+import { SEASON_SEALED_TOPIC, handleSeasonSealed } from './heraldry.ts'
 import { SIGNATURE_HEADER, signEvent, type Db } from './outbox.ts'
 import {
   isCapability,
@@ -413,6 +414,35 @@ function buildRoutes(): Route[] {
       if (!UUID.test(eventId)) {
         deps.metrics.increment('worlds_events_rejected_total', { reason: 'malformed' })
         throw new BadRequestError('an event envelope must carry a uuid id')
+      }
+      if (topic === SEASON_SEALED_TOPIC) {
+        // A sealed Aetherholm season: mint the victors' heraldry onto the shared profile. The
+        // event this consumer was missing for a full phase — §3.3p's "an event with no consumer
+        // yet" — and the reason the entitlement bridge finally carries something across titles.
+        const raw = envelope['payload']
+        const payload =
+          typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+            ? (raw as Record<string, unknown>)
+            : {}
+        const seasonId = typeof payload['seasonId'] === 'string' ? payload['seasonId'] : ''
+        const victors = Array.isArray(payload['victors']) ? payload['victors'] : []
+        if (!seasonId) throw new BadRequestError('season.sealed must carry seasonId')
+        const done = deps.lifecycle.track()
+        try {
+          const result = await handleSeasonSealed(deps.sql, deps.producer, eventId, {
+            seasonId,
+            victors: victors as never,
+            correlationId:
+              typeof envelope['correlationId'] === 'string' ? envelope['correlationId'] : eventId,
+          })
+          if (result.status === 'duplicate') {
+            return { status: 200, body: { status: 'duplicate', eventId } }
+          }
+          ctx.log.info('heraldry granted', { seasonId, ...result.outcome })
+          return { status: 202, body: { status: 'granted', ...result.outcome } }
+        } finally {
+          done()
+        }
       }
       if (topic !== GRANTED_TOPIC) {
         // Accepted and ignored, with a 202. A 4xx would make the producer's relay retry an event

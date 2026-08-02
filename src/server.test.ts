@@ -532,3 +532,90 @@ test('an unmatched path collapses to one metric label', { skip }, async () => {
   assert.match(metrics, /route="unmatched"/)
   assert.doesNotMatch(metrics, /route="\/v1\/nope\/12345"/)
 })
+
+/* ------------------------------------------------------------------ HERALDRY */
+
+test('a sealed season mints ranked, bound, cross-title heraldry for every victor member', { skip }, async () => {
+  const BOB = '22222222-2222-4222-8222-222222222222'
+  const CARA = '33333333-3333-4333-8333-333333333333'
+  const eventId = '0be5c9a1-6c1a-4b6e-8a5e-9a0d3f1c2b4a'
+  const envelope = {
+    id: eventId,
+    topic: 'aetherholm.season.sealed',
+    key: 'season-1',
+    occurredAt: new Date().toISOString(),
+    producer: 'aetherholm',
+    version: '1.0',
+    correlationId: 'corr-seal-1',
+    payload: {
+      seasonId: 'a3d1b0aa-0000-4000-8000-000000000001',
+      digest: 'd'.repeat(64),
+      victors: [
+        // Rank 1: an alliance — the grant fans out to EVERY member on the payload.
+        { kind: 'alliance', userIds: [ALICE, BOB] },
+        // Rank 2: a lone holder.
+        { kind: 'player', userId: CARA, userIds: [CARA] },
+      ],
+    },
+  }
+  const first = await postEvent(envelope)
+  assert.equal(first.status, 202)
+  assert.equal(first.body['status'], 'granted')
+  assert.equal(first.body['granted'], 3, 'two alliance members and one solo victor')
+
+  const rows = await sql<{ user_id: string; item_urn: string; bound: boolean; title_scope: string; source: string }[]>`
+    select user_id, item_urn, bound, title_scope, source from inventory_items
+     where item_urn like 'cf:aetherholm:heraldry:%' order by item_urn, user_id
+  `
+  assert.equal(rows.length, 3)
+  for (const row of rows) {
+    assert.equal(row.bound, true, 'a victory cannot be sold')
+    assert.equal(row.title_scope, '*', 'heraldry is visible in every title')
+    assert.equal(row.source, 'reward')
+  }
+  assert.match(rows[0]!.item_urn, /rank:1$/)
+  assert.match(rows[2]!.item_urn, /rank:2$/)
+
+  // Redelivery: at-least-once means this WILL happen. One inbox row, no new items, no new outbox.
+  const again = await postEvent(envelope)
+  assert.equal(again.status, 200)
+  assert.equal(again.body['status'], 'duplicate')
+  const after = await sql<{ n: number }[]>`
+    select count(*)::int as n from inventory_items where item_urn like 'cf:aetherholm:heraldry:%'
+  `
+  assert.equal(after[0]!.n, 3, 'a redelivered seal mints nothing')
+
+  // And the grants left outbox events — the profile change is announced like every other.
+  const emitted = await sql<{ n: number }[]>`
+    select count(*)::int as n from outbox where topic = 'worlds.inventory.granted'
+  `
+  assert.ok(emitted[0]!.n >= 3, 'each grant announces itself on the bus')
+})
+
+test('a second sealed season grants again — the per-user idempotency is per SEASON', { skip }, async () => {
+  // Self-contained: its own victor and both seasons inside one test, because the harness resets
+  // state between tests and an expectation leaning on a sibling's rows is an expectation about
+  // the harness, not the code.
+  const DANA = '44444444-4444-4444-8444-444444444444'
+  for (const n of [1, 2]) {
+    const reply = await postEvent({
+      id: `1ce5c9a1-6c1a-4b6e-8a5e-9a0d3f1c2b4${n}`,
+      topic: 'aetherholm.season.sealed',
+      key: `season-${n}`,
+      occurredAt: new Date().toISOString(),
+      producer: 'aetherholm',
+      version: '1.0',
+      payload: {
+        seasonId: `a3d1b0aa-0000-4000-8000-00000000000${n}`,
+        victors: [{ kind: 'player', userId: DANA, userIds: [DANA] }],
+      },
+    })
+    assert.equal(reply.body['status'], 'granted')
+  }
+  const mine = await sql<{ n: number }[]>`
+    select count(*)::int as n from inventory_items
+     where user_id = ${DANA} and item_urn like 'cf:aetherholm:heraldry:%'
+  `
+  assert.equal(mine[0]!.n, 2, 'one banner per season, not one banner ever')
+})
+
