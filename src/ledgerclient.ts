@@ -21,6 +21,7 @@
 
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
+import { engagementAccount } from '@cloudsforge/contracts-money'
 import type { Actor, EntryKind, LedgerAssetCode } from '@cloudsforge/contracts-money'
 
 export const LEDGER_SCOPES: readonly string[] = Object.freeze(['ledger:post'])
@@ -89,9 +90,32 @@ export interface LedgerClient {
  * in.
  *
  * The direction is the opposite of a purchase and that is the point — this is the platform GIVING
- * a customer money, so it must show up as an expense the platform can be asked about rather than
- * as a number that appeared in a player's row. Balanced by construction because it is the same
+ * a customer money, so it must show up as a spend the platform can be asked about rather than as
+ * a number that appeared in a player's row. Balanced by construction because it is the same
  * number on both sides.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE DEBIT SIDE IS `engagement:worlds`, AND IT FIXED A LIVE COLLISION.**
+ *
+ * docs/ecosystem/21 §4: "every grant a service pays out references its engagement account as the
+ * debit side", so that an auditor reconstructs the programme from the ledger alone. §1 names this
+ * service's gap exactly — `seasons.reward_budget_shards` is required positive but "nothing
+ * anywhere says who funds it". This posting is the answer: the budget is an allowance against
+ * `engagement:worlds`, and the money leaves that account when a reward is paid.
+ *
+ * It also removes a defect that would have failed in production the first time both services ran.
+ * This function used to debit `(platform, SHARD, fees)` as type `expense`, while `micro-market`
+ * and `micro-trade` credit the SAME account key as type `revenue`
+ * (market/src/ledgerclient.ts:123). The ledger's account key is `(subject, asset_code, purpose)`
+ * and `ensureAccount` THROWS `AccountConflictError` when a caller's type disagrees with the
+ * existing row (ledger/src/accounts.ts:125) — so whichever service posted second would have had
+ * every entry refused. Nothing caught it because each suite uses its own fake ledger.
+ *
+ * `equity` is load-bearing beyond the collision: the ledger's overdraft trigger exempts
+ * `clearing` and `suspense`, NOT `equity`, so a reward that would take the engagement account
+ * negative is refused BY THE LEDGER. "Who funds this budget" stops being unanswerable and starts
+ * being enforced.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 export function rewardPostings(input: {
   readonly subject: string
@@ -99,7 +123,15 @@ export function rewardPostings(input: {
 }): readonly PostingRequest[] {
   return [
     {
-      account: { subject: 'platform', assetCode: 'SHARD', purpose: 'fees', type: 'expense' },
+      // Spelled by @cloudsforge/contracts-money, never here: the account key is
+      // (subject, asset_code, purpose), so a second spelling would be a second account and would
+      // split the programme's ledger in half.
+      account: {
+        subject: engagementAccount('worlds', 'SHARD').subject,
+        assetCode: 'SHARD',
+        purpose: 'treasury',
+        type: 'equity',
+      },
       direction: 'debit',
       amount: input.amount,
       assetCode: 'SHARD',

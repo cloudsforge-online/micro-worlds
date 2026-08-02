@@ -100,11 +100,21 @@ test('a reward is a BALANCED LEDGER POSTING, not a column somewhere', { skip }, 
   assert.equal(ledger.entries[0]?.kind, 'reward_granted')
   const postings = ledger.entries[0]?.postings ?? []
   assert.equal(postings.length, 2)
-  // The platform GIVES the customer money, so it shows up as an expense the platform can be asked
-  // about rather than as a number that appeared in a player's row.
+  // The platform GIVES the customer money, so it shows up as a spend the platform can be asked
+  // about rather than as a number that appeared in a player's row — and docs/ecosystem/21 §4
+  // says WHICH spend: the title's engagement account, so the programme is reconstructable from
+  // the ledger alone and "who funds this season's budget" has an answer.
+  //
+  // This assertion used to read `platform` / `expense`, which was a live defect rather than a
+  // preference: micro-market and micro-trade credit the same (platform, SHARD, fees) key as
+  // `revenue`, and the ledger THROWS AccountConflictError on a type disagreement
+  // (ledger/src/accounts.ts:125) — whichever service posted second would have had every entry
+  // refused. `equity` also denies the account the overdraft exemption that `clearing` and
+  // `suspense` get, so an unfunded engagement account refuses the reward at the ledger.
   assert.equal(postings[0]?.direction, 'debit')
-  assert.equal(postings[0]?.account.subject, 'platform')
-  assert.equal(postings[0]?.account.type, 'expense')
+  assert.equal(postings[0]?.account.subject, 'engagement:worlds')
+  assert.equal(postings[0]?.account.purpose, 'treasury')
+  assert.equal(postings[0]?.account.type, 'equity')
   assert.equal(postings[1]?.direction, 'credit')
   assert.equal(postings[1]?.account.subject, `user:${ALICE}`)
   assert.equal(postings[0]?.amount, postings[1]?.amount)

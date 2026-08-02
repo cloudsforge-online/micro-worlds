@@ -361,6 +361,44 @@ export const MIGRATIONS: readonly Migration[] = [
       create index if not exists reward_grants_season_idx on reward_grants (season_id, granted_at desc);
     `,
   },
+  {
+    version: 9,
+    name: 'season_funding_source',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      -- WHO FUNDS A SEASON'S BUDGET — docs/ecosystem/21 §1 and §5.
+      --
+      -- 21 §1 names this service's gap precisely: 'seasons.reward_budget_shards' already exists
+      -- and is required positive, "but nothing anywhere says who funds it. A season with an
+      -- unfunded budget cannot pay a single reward." §5's answer is that a season's budget is an
+      -- operator-approved transfer from the title's engagement account.
+      --
+      -- Two halves, and the SECOND is the one with teeth:
+      --
+      --   1. The season records its funding source, so the question has a written answer on the
+      --      row rather than in a runbook.
+      --   2. Rewards now DEBIT 'engagement:worlds' (src/ledgerclient.ts, rewardPostings). That
+      --      account is 'equity', and the ledger's overdraft trigger exempts only 'clearing' and
+      --      'suspense' — so a season whose engagement account is empty cannot pay a reward, and
+      --      finds that out from the ledger rather than from a budget number nobody funded.
+      --
+      -- The budget column stays the CAP (it bounds what a season may pay); the engagement account
+      -- balance is the FUNDING (it bounds what can actually be paid). A cap above the funding is
+      -- not a lie any more — it simply cannot be drawn past what was transferred in.
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      alter table seasons add column if not exists funding_source text not null
+        default 'engagement:worlds';
+
+      -- A closed list of one, today. It is a constraint rather than a comment because the whole
+      -- point of §4 is that an auditor can reconstruct the programme from the ledger: a season
+      -- funded from somewhere nobody enumerated is a season whose spend does not appear in the
+      -- programme's totals.
+      alter table seasons drop constraint if exists seasons_funding_source_known;
+      alter table seasons add constraint seasons_funding_source_known check (
+        funding_source = 'engagement:worlds'
+      );
+    `,
+  },
 ]
 
 /**
