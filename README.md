@@ -1,5 +1,7 @@
 # `micro-worlds`
 
+[![ci](https://github.com/cloudsforge-online/micro-worlds/actions/workflows/ci.yml/badge.svg)](https://github.com/cloudsforge-online/micro-worlds/actions/workflows/ci.yml) [![TypeScript](https://img.shields.io/badge/TypeScript-strict%20ESM-3178C6?logo=typescript&logoColor=white)](./tsconfig.base.json) [![node](https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs&logoColor=white)](./package.json) [![tests](https://img.shields.io/badge/tests-real%20Postgres-4169E1?logo=postgresql&logoColor=white)](./.github/workflows/ci.yml)
+
 The title registry, the cross-title player profile and inventory, achievements, seasons, rewards
 that are real money — and **the entitlement bridge**: the consumer of
 `billing.entitlement.granted` that finally turns a paid private world into a world that exists.
@@ -350,5 +352,5 @@ This closes the gap `18-build-status` §3.3p recorded as "an event with no consu
 
 ## Provenance
 
-The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
-human direction and review.
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, assets
+generated with **FLUX 2 Pro**, under human direction and review.
