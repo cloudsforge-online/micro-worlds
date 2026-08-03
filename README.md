@@ -4,6 +4,8 @@ The title registry, the cross-title player profile and inventory, achievements, 
 that are real money — and **the entitlement bridge**: the consumer of
 `billing.entitlement.granted` that finally turns a paid private world into a world that exists.
 
+Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
+
 > **It owns nothing a title owns.** A title service owns simulation state; this service owns
 > anything that must outlive a season or cross a title (`src/migrations.ts:122-123`). It also holds
 > no money: a reward is a posting to `micro-ledger`, and the budget that bounds it is a database
@@ -343,3 +345,10 @@ Grants, inbox claim and the `worlds.inventory.granted` outbox rows commit or van
 (`handleSeasonSealed`, `src/heraldry.ts`).
 
 This closes the gap `18-build-status` §3.3p recorded as "an event with no consumer yet".
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
