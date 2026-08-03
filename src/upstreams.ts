@@ -16,10 +16,11 @@
  *
  * ── THE TEN-MINUTE CLIFF ───────────────────────────────────────────────────────────────────────
  *
- * A service token expires in 600 seconds (identity/src/tokens.ts:28). This service read one once
- * at boot, and nothing re-minted it — nothing could, because minting required the `admin` role. Ten
- * minutes into every deployment, the ledger and billing began refusing every call, and no test
- * here could see it because a test mints a token and uses it within seconds.
+ * A service token expires in 600 seconds (`SERVICE_TTL_SECONDS`, identity/src/tokens.ts:33). This
+ * service read one once at boot, and nothing re-minted it — nothing could, because minting
+ * required the `admin` role. Ten minutes into every deployment, the ledger and billing began
+ * refusing every call, and no test here could see it because a test mints a token and uses it
+ * within seconds.
  *
  * identity now mints for a service on demand. What this container holds at rest is a CREDENTIAL,
  * not a token: long-lived, revocable, worth nothing on its own, and exchangeable for an ordinary

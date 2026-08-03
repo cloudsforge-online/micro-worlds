@@ -6,8 +6,8 @@
  *
  *     const token = () => env.serviceToken        // src/index.ts, before this change
  *
- * A string read once at boot, from a token that expires in 600 seconds
- * (identity/src/tokens.ts:28), which nothing could re-mint because minting required the `admin`
+ * A string read once at boot, from a token that expires in 600 seconds (`SERVICE_TTL_SECONDS`,
+ * identity/src/tokens.ts:33), which nothing could re-mint because minting required the `admin`
  * role. Every peer call in this service began failing ten minutes into every deployment.
  *
  * WHY THIS SUITE COULD NOT SEE IT, AND WHY THIS FILE IS SHAPED AS IT IS. Every other test here
@@ -37,7 +37,7 @@ const IDENTITY = 'http://identity:4000'
 const PEER = 'http://billing:4000'
 const CREDENTIAL = 'cfsc_a-long-lived-credential-that-does-not-expire'
 
-/** identity/src/tokens.ts:28. Unchanged by this fix, and it must stay unchanged. */
+/** `SERVICE_TTL_SECONDS`, identity/src/tokens.ts:33. Unchanged by this fix, and must stay so. */
 const SERVICE_TTL_SECONDS = 600
 
 const T0 = Date.UTC(2026, 7, 3, 12, 0, 0)

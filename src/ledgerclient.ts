@@ -40,8 +40,8 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
  * The consequence is not a 403 on one call. `micro-deploy`'s `derive-grants.mjs` reads this
  * constant into `IDENTITY_SERVICE_TOKEN_GRANTS`, and identity validates that list against the
  * registry at import and REFUSES TO START on a name it does not know
- * (`identity/src/env.ts:141`). An unregistered demand here is a dead identity container, and
- * therefore no tokens for anybody.
+ * (`parseServiceGrants`, identity/src/env.ts:169). An unregistered demand here is a dead identity
+ * container, and therefore no tokens for anybody.
  *
  * ── AND `LiveScope` RATHER THAN `Scope` ───────────────────────────────────────────────────────
  *
@@ -52,7 +52,7 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
  *
  * `LiveScope = Exclude<Scope, DeprecatedScope>`, and `DeprecatedScope` is computed FROM `SCOPES`
  * by a conditional type over the `deprecated` field rather than hand-listed
- * (`contracts/packages/auth/src/index.ts:507`), so it cannot drift from the registry — a
+ * (`contracts/packages/auth/src/index.ts:527`), so it cannot drift from the registry — a
  * hand-written companion list is the failure that package keeps catching.
  *
  * `Scope` deliberately keeps its wide meaning and this does not narrow it: a token arriving from
@@ -141,7 +141,7 @@ export interface LedgerClient {
  * It also removes a defect that would have failed in production the first time both services ran.
  * This function used to debit `(platform, SHARD, fees)` as type `expense`, while `micro-market`
  * and `micro-trade` credit the SAME account key as type `revenue`
- * (market/src/ledgerclient.ts:123). The ledger's account key is `(subject, asset_code, purpose)`
+ * (market/src/ledgerclient.ts:135). The ledger's account key is `(subject, asset_code, purpose)`
  * and `ensureAccount` THROWS `AccountConflictError` when a caller's type disagrees with the
  * existing row (ledger/src/accounts.ts:125) — so whichever service posted second would have had
  * every entry refused. Nothing caught it because each suite uses its own fake ledger.
