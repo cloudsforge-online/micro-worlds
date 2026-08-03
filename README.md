@@ -219,9 +219,16 @@ scan is the size of the backlog rather than the size of every rental ever sold
 
 `.env.example` and `src/env.ts` were cross-checked and **agree**: every variable `loadEnv` reads is
 present with its real default, and nothing extra is declared. `OUTBOX_SIGNING_SECRET` and
-`WORLDS_SERVICE_TOKEN` ship **empty**, so a copied file refuses to boot until they are filled —
-which is the fail-closed pattern, unlike the estate repositories that ship a long placeholder that
-clears the length check.
+`WORLDS_IDENTITY_CREDENTIAL` ship **empty**, so a copied file refuses to boot until they are filled
+— which is the fail-closed pattern, unlike the estate repositories that ship a long placeholder
+that clears the length check.
+
+**`WORLDS_SERVICE_TOKEN` is retired.** It was a service *token*, and a service token expires in 600
+seconds (`identity/src/tokens.ts:28`). This service read one once at boot and nothing re-minted it,
+so ten minutes into every deployment the ledger and billing refused every call. What a container
+holds at rest is now a *credential*: long-lived, revocable, worth nothing by itself, exchanged for
+an ordinary ten-minute token whenever one is needed. Setting the old variable is logged as ignored
+at boot rather than silently obeyed. See `src/upstreams.ts` and `@cloudsforge/auth`.
 
 | Variable | Default | If it is wrong or missing |
 | --- | --- | --- |
@@ -237,7 +244,9 @@ clears the length check.
 | `INSTANCE_ID` | hostname | names this replica in `jobs.locked_by` **and in `provisions.lease_owner`** (`src/env.ts:180`) |
 | `LEDGER_URL` | — | **required**. No posting, no reward (`src/env.ts:182`) |
 | `BILLING_URL` | — | **required**. Where `GET /internal/entitlements/:userId` is asked (`src/env.ts:183`) |
-| `WORLDS_SERVICE_TOKEN` | — | **required, ≥24 chars.** Carries `ledger:post` and `billing:read` (`src/env.ts:184`) |
+| `WORLDS_IDENTITY_CREDENTIAL` | — | **≥24 chars, `cfsc_…`.** The long-lived credential exchanged at `POST /service-tokens/exchange` for a ten-minute token carrying `ledger:post` and `billing:read`. Technically optional so the image can boot for CI's `/livez` smoke test, but `/readyz` fails hard without it and every peer call 503s |
+| `IDENTITY_URL` | `IDENTITY_ISSUER` | where the credential is exchanged. Only set it where the issuer and the dialled address genuinely differ |
+| `WORLDS_SERVICE_TOKEN` | — | **retired.** A 600-second token read once at boot. If still set, boot logs that it is ignored |
 | `WORLDS_UPSTREAM_DEADLINE_MS` | `5000` | 100–60000, for ledger and billing (`src/env.ts:185`) |
 | `WORLDS_TITLE_DEADLINE_MS` | `20000` | 100–120000, **longer than the estate's other upstream deadlines deliberately**: provisioning a world writes up to four thousand tile rows in the title service, and a deadline shorter than that work **turns every provision into a retry of something that succeeded** (`src/env.ts:189`, reasoning at `:186-188`) |
 | `WORLDS_PROVISIONING_ENABLED` | `true` | set `false` to pause provisioning without pausing the service. Nothing is lost: rows sit `pending` and the sweep drains them (`src/env.ts:191`) |

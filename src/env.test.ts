@@ -22,9 +22,15 @@ const BASE: Record<string, string> = {
   OUTBOX_SIGNING_SECRET: 'a-real-looking-secret-of-sufficient-length',
   LEDGER_URL: 'http://127.0.0.1:4007',
   BILLING_URL: 'http://127.0.0.1:4009',
-  WORLDS_SERVICE_TOKEN: 'another-real-looking-secret-value-here',
 }
 for (const [key, value] of Object.entries(BASE)) process.env[key] = value
+
+/**
+ * The credential is NOT in `BASE`, because it is not required — see the field comment in `env.ts`.
+ * `WORLDS_SERVICE_TOKEN` is not there either: it was removed, and the tests below assert that its absence is
+ * fine and its presence is reported rather than silently obeyed.
+ */
+const CREDENTIAL = 'cfsc_a-long-lived-credential-that-does-not-expire'
 
 const { EnvError, SERVICE, env, loadEnv } = await import('./env.ts')
 
@@ -82,4 +88,45 @@ test('provisioning can be turned off without turning the service off', () => {
 
 test('INSTANCE_ID falls back to the hostname, which is what names a stuck lease', () => {
   assert.equal(loadEnv(BASE, 'pod-7').instanceId, 'pod-7')
+})
+
+/* ────────────────────────────────────────────────────────────────────────────────────────────────
+ * The credential that replaced WORLDS_SERVICE_TOKEN. See `env.ts` and `@cloudsforge/auth`.
+ * ──────────────────────────────────────────────────────────────────────────────────────────────── */
+
+test('the identity credential is read, and its absence is a null rather than a throw', () => {
+  assert.equal(loadEnv({ ...BASE, WORLDS_IDENTITY_CREDENTIAL: CREDENTIAL }).identityCredential, CREDENTIAL)
+  // Absent must LOAD — the image has to boot without one so the CI smoke test can read /livez —
+  // and is caught by the hard `identity-credential` readiness probe instead.
+  assert.equal(loadEnv(BASE).identityCredential, null)
+})
+
+test('a credential that is present but too short is refused, not accepted as configured', () => {
+  // Absent is a deployment nobody has given a credential to. A short one is a deployment that
+  // BELIEVES it has one, and would fail on its first call to a peer with a 401 that reads as
+  // "identity rejected this service" rather than "nobody set this variable".
+  assert.throws(
+    () => loadEnv({ ...BASE, WORLDS_IDENTITY_CREDENTIAL: 'cfsc_short' }),
+    (err: unknown) => err instanceof EnvError && err.message.includes('WORLDS_IDENTITY_CREDENTIAL'),
+  )
+})
+
+test('identityUrl derives from the issuer, and IDENTITY_URL overrides it', () => {
+  // The issuer of a token is by definition where the token came from, so demanding a fourth
+  // identity variable would only create a way for the exchange and the JWKS to disagree.
+  assert.equal(loadEnv(BASE).identityUrl, BASE['IDENTITY_ISSUER'])
+  assert.equal(
+    loadEnv({ ...BASE, IDENTITY_URL: 'http://identity.internal:4000' }).identityUrl,
+    'http://identity.internal:4000',
+  )
+})
+
+test('WORLDS_SERVICE_TOKEN is no longer required, and being set is reported rather than obeyed', () => {
+  // The retired variable. It was a 600-second token read once at boot; ten minutes into every
+  // deployment every call to a peer failed and nothing could re-mint it.
+  assert.equal(loadEnv(BASE).legacyServiceTokenPresent, false)
+  const withLegacy = loadEnv({ ...BASE, WORLDS_SERVICE_TOKEN: 'a-real-looking-secret-of-sufficient-length' })
+  assert.equal(withLegacy.legacyServiceTokenPresent, true)
+  // And it confers nothing: setting it must not make the service look configured.
+  assert.equal(withLegacy.identityCredential, null)
 })
