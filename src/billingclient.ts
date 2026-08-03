@@ -33,8 +33,18 @@
  */
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
+import type { LiveScope } from '@cloudsforge/contracts-auth'
 
-export const BILLING_SCOPES: readonly string[] = Object.freeze(['billing:read'])
+/**
+ * The scopes this service's token must carry to call this peer.
+ *
+ * `readonly LiveScope[]` rather than `readonly string[]`: see the header of `ledgerclient.ts`.
+ * This is an outbound demand, `derive-grants.mjs` reads it into the estate's grant list, and
+ * identity
+ * refuses to boot on a name the registry does not have — or has deprecated, which `Scope` alone
+ * would not have caught.
+ */
+export const BILLING_SCOPES: readonly LiveScope[] = Object.freeze(['billing:read'])
 
 /** Billing could not be reached, or answered 5xx. We do not know what this account owns. */
 export class BillingUnavailableError extends Error {
