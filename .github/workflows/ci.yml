@@ -41,16 +41,27 @@ jobs:
       postgres-version: '17'
       # The image smoke test boots the real service, and src/env.ts validates its configuration at
       # import — so the container needs the variables it declares, not just a database, or it exits
-      # before it can serve /livez. CI-only NON-secrets: the two secrets only have to clear a
+      # before it can serve /livez. CI-only NON-secrets: OUTBOX_SIGNING_SECRET only has to clear a
       # length check, and the upstream URLs are never dialled because /livez needs no upstream.
       # Never a real credential.
+      #
+      # THIS IS EXACTLY WHAT src/env.ts:232-241 DEMANDS AND NOTHING ELSE, which it was not.
+      # `WORLDS_SERVICE_TOKEN` was set here too, and it is RETIRED: env.ts:245 reads it for one
+      # purpose — to report it — and src/index.ts:113 logs `WORLDS_SERVICE_TOKEN is set and is
+      # IGNORED` at ERROR. So every smoke run of this workflow printed a configuration error about
+      # a variable this file was itself supplying. A placeholder rather than a secret, but a
+      # deployment error in the logs of a job whose whole purpose is to prove the image boots
+      # cleanly is a signal nobody can afford to learn to ignore.
+      #
+      # Its replacement, `WORLDS_IDENTITY_CREDENTIAL`, is deliberately NOT added: env.ts:180-183
+      # says in as many words that it is optional so that this job can boot the image without one,
+      # and `/readyz` — not `/livez` — is where its absence is enforced.
       smoke-env: |
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
         OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
         LEDGER_URL=http://127.0.0.1:4007
         BILLING_URL=http://127.0.0.1:4009
-        WORLDS_SERVICE_TOKEN=ci-only-not-a-real-token-0000000000000
     secrets:
       # @cloudsforge/* resolves through link:../runtime and link:../contracts rather than a
       # registry, so the workflow checks out micro-runtime and micro-contracts as siblings. Both are
