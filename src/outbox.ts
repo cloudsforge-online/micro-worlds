@@ -24,7 +24,6 @@ import {
   verifyDelivery,
   type DeliveryVerification,
 } from '@cloudsforge/contracts-events'
-import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { Sql, TransactionSql } from 'postgres'
 import { HttpClient } from '@cloudsforge/http'
 import type { Logger } from '@cloudsforge/telemetry'

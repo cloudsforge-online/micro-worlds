@@ -108,10 +108,19 @@ jobs:
           grep -q 'seasons_within_budget' src/migrations.ts \
             || { echo '::error::the season budget cap is gone; a reward exploit would be unbounded'; exit 1; }
 
+      # This used to grep src/server.ts for `timingSafeEqual`, which asserted the primitive rather
+      # than the check. The comparison now lives in the contract's verifier, where it belongs and
+      # where it cannot drift — the local one it replaced re-signed with Date.now() and compared
+      # whole header strings, so an honest delivery that outlived the second it was minted in was
+      # refused as a forgery. So assert the two facts that actually keep the door shut: the route
+      # still calls the check, and the check still goes through the shared verifier rather than a
+      # hand-rolled MAC. src/server.test.ts pins the remaining half — that it happens before parse.
       - name: 'The entitlement webhook still verifies a signature'
         run: |
-          grep -q 'timingSafeEqual' src/server.ts \
+          grep -q 'verifyEventSignature(' src/server.ts \
             || { echo '::error::the event signature check is gone; POST /v1/events is a free-worlds endpoint'; exit 1; }
+          grep -q 'verifyDelivery(' src/outbox.ts \
+            || { echo '::error::the signature check no longer uses the contract verifier; a local MAC drifts'; exit 1; }
 
       # A `*/` in the MIDDLE of a block comment terminates it early and silently uncomments
       # whatever follows. The pattern matches a continuation line of a block comment (leading `*`)
