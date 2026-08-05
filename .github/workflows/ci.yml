@@ -41,9 +41,14 @@ jobs:
       postgres-version: '17'
       # The image smoke test boots the real service, and src/env.ts validates its configuration at
       # import — so the container needs the variables it declares, not just a database, or it exits
-      # before it can serve /livez. CI-only NON-secrets: OUTBOX_SIGNING_SECRET only has to clear a
-      # length check, and the upstream URLs are never dialled because /livez needs no upstream.
-      # Never a real credential.
+      # before it can serve /livez. The upstream URLs are never dialled because /livez needs no
+      # upstream, and `OUTBOX_SIGNING_SECRET` is GENERATED per run — see the block below. Never a
+      # real credential.
+      #
+      # This comment used to say that secret "only has to clear a length check". That sentence was
+      # the defect written into configuration, and it is why it is quoted here rather than deleted:
+      # a length check is exactly what micro-org #142's 40-character placeholder cleared on 44
+      # containers across both networks.
       #
       # THIS IS EXACTLY WHAT src/env.ts:232-241 DEMANDS AND NOTHING ELSE, which it was not.
       # `WORLDS_SERVICE_TOKEN` was set here too, and it is RETIRED: env.ts:245 reads it for one
@@ -56,10 +61,25 @@ jobs:
       # Its replacement, `WORLDS_IDENTITY_CREDENTIAL`, is deliberately NOT added: env.ts:180-183
       # says in as many words that it is optional so that this job can boot the image without one,
       # and `/readyz` — not `/livez` — is where its absence is enforced.
+      #
+      # ── `=@generate`, AND WHY THE LITERAL THAT WAS HERE HAD TO GO ────────────────────────────
+      #
+      # `OUTBOX_SIGNING_SECRET` was `ci-only-not-a-real-secret-000000000000`: 36 characters, past
+      # the 24-character floor `env.ts` used to apply, and a placeholder. `env.ts` now runs
+      # `@cloudsforge/secrets`, which asserts the SHAPE of a generated value — the literal
+      # normalises to a string containing both `cionly` and `notareal` and is refused twice over.
+      # There is no CI exemption in that guard on purpose (micro-org #142): an escape hatch is
+      # reached for in exactly the hurry that produced the defect.
+      #
+      # CI does not need a WEAK secret, it needs A secret. Nothing in the smoke test verifies a
+      # signature against anything else, so `=@generate` asks the shared workflow for a fresh
+      # `openssl rand -base64 48` per run and it is thrown away (micro-org `service-ci.yml`). On
+      # this service the key is load-bearing in a way worth restating: it is what `POST /v1/events`
+      # verifies inbound entitlement grants with, so a placeholder here is a free-worlds endpoint.
       smoke-env: |
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
-        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
+        OUTBOX_SIGNING_SECRET=@generate
         LEDGER_URL=http://127.0.0.1:4007
         BILLING_URL=http://127.0.0.1:4009
     secrets:

@@ -24,6 +24,12 @@
  */
 
 import { hostname } from 'node:os'
+import {
+  SecretError,
+  assertGeneratedSecret,
+  assertServiceCredential,
+  parseSecretList,
+} from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -40,17 +46,24 @@ export class EnvError extends Error {
   }
 }
 
-const PLACEHOLDERS = new Set([
-  'changeme',
-  'change-me',
-  'placeholder',
-  'secret',
-  'token',
-  'dev-secret',
-  'dev-outbox-signing-secret',
-  'replace-with-a-real-secret',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-])
+/**
+ * THE `PLACEHOLDERS` SET THAT USED TO BE HERE IS GONE, AND ITS ABSENCE IS THE FIX.
+ *
+ * It held nine exact strings and was paired with a 24-character floor, and the private
+ * `parseSecretList` below applied both to every entry of the rotation list. Neither could fail for
+ * the value that actually reached 44 containers on both networks: micro-org #142's
+ * `estate-only-outbox-secret-00000000000000` is 40 characters and was on nobody's list. A check
+ * that cannot fail is worse than no check, because the absence of an alarm gets read as the absence
+ * of a problem — and on THIS service the key in question is what `POST /v1/events` verifies an
+ * inbound entitlement grant with, so a placeholder is a free-worlds endpoint.
+ *
+ * A deny-list of exact strings is structurally unable to work: the next placeholder somebody
+ * writes is, by definition, not on it. `@cloudsforge/secrets` asserts the SHAPE of a generated
+ * value instead, which is the property a placeholder cannot have. It is imported rather than
+ * copied so that this service cannot drift from the other sixteen — this repository's own copy of
+ * `parseSecretList` was one of ELEVEN, four of which took the `minLength = 24` parameter that is
+ * the keystroke floor the shared package exists to replace.
+ */
 
 type Source = Readonly<Record<string, string | undefined>>
 
@@ -60,70 +73,88 @@ function required(source: Source, name: string): string {
   return value
 }
 
-function requiredSecret(source: Source, name: string, minLength = 24): string {
+/**
+ * Re-wrap the shared guard's `SecretError` as this service's `EnvError`.
+ *
+ * `loadEnv` documents a single error class for every configuration failure, and the boot path
+ * catches that one class. The message is preserved verbatim — it already names the variable and
+ * the command that fixes it, and it never contains the value.
+ */
+function asEnvError<T>(run: () => T): T {
+  try {
+    return run()
+  } catch (err) {
+    if (err instanceof SecretError) throw new EnvError(err.message)
+    throw err
+  }
+}
+
+/**
+ * The estate's shared event-bus HMAC key — and on THIS service the thing standing between "billing
+ * said this customer bought a private world" and "anyone who can reach this port said so".
+ *
+ * `assertGeneratedSecret` asserts what a placeholder cannot have: the base64 or hex alphabet (no
+ * hyphens — every placeholder this estate wrote had one), 32 decoded BYTES rather than 24
+ * keystrokes, and a measured Shannon entropy floor. The old `minLength` parameter is gone rather
+ * than kept in front: it is a strict subset of the shape check, and running it first answers a
+ * 40-character placeholder with "must be at least 24 characters" — true, useless, and about the
+ * wrong property.
+ */
+function requiredSigningSecret(source: Source, name: string): string {
   const value = required(source, name)
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  // Length is a proxy for entropy and the only one available here. It is set above the point at
-  // which a human-chosen string is plausible, so a memorable password fails this check too.
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
-  }
+  asEnvError(() => assertGeneratedSecret(name, value))
   return value
 }
 
 /**
- * A secret that may be absent, but must be real if present.
+ * A SERVICE CREDENTIAL that may be absent, but must be real if present.
  *
- * The distinction matters for the identity credential: absent is a deployment that has not been
- * given one yet and is reported by `/readyz`; a short placeholder is a deployment that believes it
- * HAS one, and would fail on its first call to a peer with a 401 that reads as "identity rejected
- * this service" rather than "nobody set this variable".
+ * ── ABSENCE IS A SUPPORTED MODE, AND IT STAYS ONE ──────────────────────────────────────────────
+ *
+ * Absent is a deployment that has not been granted a credential yet; it returns `null`, `/readyz`
+ * reports the `identity-credential` probe as a HARD failure, and the replica never takes traffic.
+ * The empty check therefore stays AHEAD of the assertion, because compose interpolates
+ * `${WORLDS_IDENTITY_CREDENTIAL:-}` and an unset credential arrives as the EMPTY STRING — that is
+ * the supported mode, not a malformed one, and it is the mode CI's `/livez` smoke test boots the
+ * image in. Turning it into `exit(1)` would fail that job rather than this service.
+ *
+ * What is not supported is a value that is present and rubbish: a short placeholder is a deployment
+ * that believes it HAS a credential, and would fail on its first call to a peer with a 401 that
+ * reads as "identity rejected this service" rather than "nobody set this variable".
+ *
+ * ── WHY NOT `assertGeneratedSecret` ────────────────────────────────────────────────────────────
+ *
+ * Because it would refuse every credential this estate has ever minted, and worlds would exit 1 at
+ * boot on BOTH networks. A credential is `cfsc_` + base64url, which is neither wholly base64 nor
+ * wholly hex — the underscore in its own prefix disqualifies it. Measured live: the testnet
+ * credential also CONTAINS A HYPHEN while the mainnet one does not, so the "no hyphens" instinct
+ * that is correct for the signing key above would have booted mainnet and killed testnet.
  */
-function optionalSecret(source: Source, name: string, minLength = 24): string | null {
+function optionalCredential(source: Source, name: string): string | null {
   const value = source[name]?.trim()
   if (!value) return null
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
-  }
+  asEnvError(() => assertServiceCredential(name, value))
   return value
 }
 
 /**
- * A comma-separated list of secrets, newest first.
+ * The rotation list, split and checked — `@cloudsforge/secrets`' `parseSecretList`, imported.
  *
  * A LIST, not a value, because rotation without an overlap window means every producer must change
  * secret in the same instant this service does, and that instant does not exist during a rolling
  * deploy. The receiver publishes the new key, accepts both for a window, then drops the old one.
  *
- * Every entry is held to exactly the bar a single secret is held to — a rotation is not an excuse
- * to smuggle a placeholder in beside a real key. The house pattern; `devplatform/src/env.ts:103`
- * is the reference implementation and `activity` and `notify` carry the same shape.
+ * EVERY ENTRY FACES THE FULL RULE, INCLUDING THE OUTGOING ONE. In a rotation overlap window the
+ * outgoing key is the one an attacker already holds if it leaked, and "just for the drain" is
+ * exactly how a placeholder survives the rotation that was meant to remove it.
+ *
+ * NOTE THE ARGUMENT ORDER. The private copy this replaces took `(raw, name, minLength)`; the shared
+ * one takes `(name, raw)`. The wrapper exists to make that flip explicit at the one call site,
+ * because a silent swap of two `string` parameters is a change the type checker cannot catch — it
+ * would put the raw list where the variable name belongs and report the SECRET in the error message.
  */
-function parseSecretList(raw: string, name: string, minLength = 24): readonly string[] {
-  const entries = raw
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0)
-  if (entries.length === 0) throw new EnvError(`${name} is required — at least one secret`)
-  for (const entry of entries) {
-    if (PLACEHOLDERS.has(entry.toLowerCase())) {
-      throw new EnvError(`${name} contains a known placeholder — generate real secrets`)
-    }
-    if (entry.length < minLength) {
-      throw new EnvError(`${name} entries must each be at least ${minLength} characters`)
-    }
-  }
-  if (new Set(entries).size !== entries.length) {
-    // A duplicated secret makes the "which key verified this" answer ambiguous, and that answer is
-    // what tells an operator whether a rotation has finished and the old key may be dropped.
-    throw new EnvError(`${name} lists the same secret twice`)
-  }
-  return Object.freeze(entries)
+function acceptSecretList(name: string, raw: string): readonly string[] {
+  return asEnvError(() => parseSecretList(name, raw))
 }
 
 function optional(source: Source, name: string, fallback: string): string {
@@ -247,6 +278,13 @@ export interface Env {
    *
    * Read for exactly one purpose: to say so at boot. An operator who redeploys with the old
    * variable and not the new one would otherwise get a service that looks configured and is not.
+   *
+   * **THIS IS WHY micro-org #222 IS ALREADY CLOSED FOR THIS SERVICE.** The variable holds an
+   * expired JWT wherever a deployment still sets one — market's and foresight's copies of it were
+   * measured expired by 26 hours on healthy containers — and it cannot break a boot it is not
+   * consulted by. Nothing here asserts it, because nothing here trusts it: presence is REPORTED,
+   * confers nothing, and requires nothing. The estate's compose stopped passing it, and the CI
+   * smoke environment stopped supplying it, for the same reason.
    */
   readonly legacyServiceTokenPresent: boolean
   readonly upstreamDeadlineMs: number
@@ -272,7 +310,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   if (!LEVELS.has(logLevel)) {
     throw new EnvError(`LOG_LEVEL must be one of debug, info, warn, error (got ${logLevel})`)
   }
-  const signingSecret = requiredSecret(source, 'OUTBOX_SIGNING_SECRET')
+  const signingSecret = requiredSigningSecret(source, 'OUTBOX_SIGNING_SECRET')
   // Absent means "accept exactly the key we sign with", which is what every deployment does today.
   // The default is what makes this change a no-op to ship and therefore what lets the rotation be
   // staged: add the new key here first, restart, move the producers, then drop the old one.
@@ -295,16 +333,16 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     identityIssuer: required(source, 'IDENTITY_ISSUER'),
     outboxSigningSecret: signingSecret,
     outboxAcceptSecrets: acceptSecrets
-      ? parseSecretList(acceptSecrets, 'OUTBOX_ACCEPT_SECRETS')
+      ? acceptSecretList('OUTBOX_ACCEPT_SECRETS', acceptSecrets)
       : Object.freeze([signingSecret]),
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
 
     ledgerUrl: required(source, 'LEDGER_URL'),
     billingUrl: required(source, 'BILLING_URL'),
     identityUrl: optional(source, 'IDENTITY_URL', required(source, 'IDENTITY_ISSUER')),
-    // Not `requiredSecret`: see the field comment. The absence is caught by `/readyz`, which is
+    // Optional by design: see the field comment. The absence is caught by `/readyz`, which is
     // a check that can fail, rather than by a boot CI cannot perform.
-    identityCredential: optionalSecret(source, 'WORLDS_IDENTITY_CREDENTIAL'),
+    identityCredential: optionalCredential(source, 'WORLDS_IDENTITY_CREDENTIAL'),
     legacyServiceTokenPresent: (source['WORLDS_SERVICE_TOKEN']?.trim() ?? '').length > 0,
     upstreamDeadlineMs: integer(source, 'WORLDS_UPSTREAM_DEADLINE_MS', 5_000, 100, 60_000),
     // Longer than the estate's other upstream deadlines, deliberately: provisioning a world writes
