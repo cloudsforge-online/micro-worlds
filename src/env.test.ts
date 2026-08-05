@@ -55,6 +55,58 @@ test('the event signing secret is required and a placeholder is refused', () => 
   assert.throws(() => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: 'short' }, 'host'), /at least 24/)
 })
 
+/* ────────────────────────────────────────────────────────────────────────────────────────────────
+ * OUTBOX_ACCEPT_SECRETS — the rotation window.
+ *
+ * `OUTBOX_SIGNING_SECRET` is one shared key across the estate, so replacing it is not a swap: a
+ * producer that moves first would have every delivery refused here, and no world would be
+ * provisioned until the last consumer caught up. The receiver therefore accepts a LIST, and the
+ * rotation becomes: publish the new key here, restart, then move the producers, then drop the old.
+ * ──────────────────────────────────────────────────────────────────────────────────────────────── */
+
+/** Obviously fake, and long enough to clear the length rule. Never a real key. */
+const NEXT_KEY = 'rotation-fixture-next-key-not-a-real-secret'
+const PRIOR_KEY = 'rotation-fixture-prior-key-not-a-real-secret'
+
+test('with OUTBOX_ACCEPT_SECRETS unset, the accepted list is exactly the signing secret', () => {
+  // The backwards compatibility that makes deploying this change a no-op, and therefore makes the
+  // rotation stageable: an estate that has never heard of the new variable behaves as it does today.
+  assert.deepEqual(
+    [...loadEnv(BASE, 'host').outboxAcceptSecrets],
+    [BASE['OUTBOX_SIGNING_SECRET']],
+  )
+})
+
+test('OUTBOX_ACCEPT_SECRETS is a comma-separated list, newest first, and signing stays single', () => {
+  const env = loadEnv({ ...BASE, OUTBOX_ACCEPT_SECRETS: ` ${NEXT_KEY} , ${PRIOR_KEY} ` }, 'host')
+  assert.deepEqual([...env.outboxAcceptSecrets], [NEXT_KEY, PRIOR_KEY])
+  // Signing is NOT a list. Two outbound signatures would double every subscriber's verification
+  // work and leave nobody able to say which key an event was signed with.
+  assert.equal(env.outboxSigningSecret, BASE['OUTBOX_SIGNING_SECRET'])
+})
+
+test('every OUTBOX_ACCEPT_SECRETS entry is held to the same bar as the signing secret', () => {
+  assert.throws(
+    () => loadEnv({ ...BASE, OUTBOX_ACCEPT_SECRETS: `${NEXT_KEY},changeme` }, 'host'),
+    /placeholder/,
+  )
+  assert.throws(
+    () => loadEnv({ ...BASE, OUTBOX_ACCEPT_SECRETS: `${NEXT_KEY},short` }, 'host'),
+    /at least 24/,
+  )
+  // A list of separators is an empty list, which would accept nothing and 401 the whole estate.
+  assert.throws(() => loadEnv({ ...BASE, OUTBOX_ACCEPT_SECRETS: ' , , ' }, 'host'), /at least one/)
+})
+
+test('OUTBOX_ACCEPT_SECRETS listing the same secret twice is refused', () => {
+  // A duplicate makes "which key verified this" ambiguous, and that answer is how an operator
+  // knows the rotation has finished and the old key can be dropped.
+  assert.throws(
+    () => loadEnv({ ...BASE, OUTBOX_ACCEPT_SECRETS: `${NEXT_KEY},${NEXT_KEY}` }, 'host'),
+    /twice/,
+  )
+})
+
 test('the season reward budget is read as a bigint, never through Number', () => {
   const env = loadEnv({ ...BASE, WORLDS_SEASON_REWARD_BUDGET_SHARDS: '9007199254740993' }, 'host')
   assert.equal(env.seasonRewardBudgetShards, 9_007_199_254_740_993n)

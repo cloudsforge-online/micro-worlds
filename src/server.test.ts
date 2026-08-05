@@ -7,6 +7,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test, { after, before, beforeEach } from 'node:test'
 import type { AddressInfo } from 'node:net'
 import type { Server } from 'node:http'
@@ -36,6 +37,16 @@ import {
 } from './testsupport.ts'
 
 const SECRET = 'a-real-looking-secret-of-sufficient-length'
+
+/**
+ * The key being rotated IN.
+ *
+ * It leads the accepted list and NOTHING signs with it yet, which is exactly the state a rolling
+ * rotation leaves this service in for the length of the cutover window: the new key published on
+ * the receiver first, the producers still on the old one. Obviously fake, and long enough to clear
+ * the length rule in `env.ts`.
+ */
+const NEXT_SECRET = 'rotation-fixture-next-key-not-a-real-secret'
 
 const verifier: PrincipalVerifier = {
   async principal(token: string): Promise<Principal> {
@@ -93,7 +104,7 @@ before(async () => {
         enqueued.push({ kind: options.kind, key: options.key })
       },
     },
-    eventSigningSecret: SECRET,
+    eventAcceptSecrets: [NEXT_SECRET, SECRET],
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
   baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
@@ -188,6 +199,29 @@ test('an UNSIGNED event is refused and provisions nothing', { skip }, async () =
   assert.equal(enqueued.length, 0)
 })
 
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE PROPERTY THE ROTATION DEPENDS ON.**
+ *
+ * `OUTBOX_SIGNING_SECRET` is one shared key across the estate. If moving to a new one meant this
+ * service accepted only the new one, then every producer still on the old key would be 401'd for
+ * the length of the rolling deploy and no world would be provisioned in that window. So the
+ * receiver accepts a list, and the old key keeps working while the new one leads it.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('a delivery signed with the OLD key is still accepted while the NEW key leads the list', { skip }, async () => {
+  const res = await postEvent(grantedEnvelope(), { secret: SECRET })
+  assert.equal(res.status, 202)
+  assert.equal(res.body['status'], 'recorded')
+  assert.deepEqual(enqueued, [{ kind: PROVISION_KIND, key: 'title:local' }])
+})
+
+test('a delivery signed with the NEW key is accepted too — both ends of the window are open', { skip }, async () => {
+  const res = await postEvent(grantedEnvelope(), { secret: NEXT_SECRET })
+  assert.equal(res.status, 202)
+  assert.equal(res.body['status'], 'recorded')
+})
+
 test('an event signed with the WRONG key is refused', { skip }, async () => {
   const res = await postEvent(grantedEnvelope(), { secret: 'somebody-elses-secret-of-length-32ch' })
   assert.equal(res.status, 401)
@@ -208,6 +242,36 @@ test('a signature over DIFFERENT bytes is refused', { skip }, async () => {
   const benign = signEvent(JSON.stringify(grantedEnvelope({ sku: 'frame_ember' })), SECRET)
   const res = await postEvent(grantedEnvelope({ sku: 'private_saga' }), { signature: benign })
   assert.equal(res.status, 401)
+})
+
+/**
+ * The ORDER is the security property, and it is pinned rather than described.
+ *
+ * `README.md` and `worlds-web/src/lib/worlds.ts:43` both promise this endpoint is HMAC-checked over
+ * the exact bytes received BEFORE `JSON.parse`. Verifying after parsing would put a JSON parser in
+ * front of the authentication, reachable by anyone who can open a socket, and would check a MAC
+ * over a re-serialisation rather than over what arrived — and `JSON.parse` then `JSON.stringify` is
+ * not the identity function, so every honest delivery would be refused too.
+ *
+ * No database, so this one runs everywhere.
+ */
+test('POST /v1/events verifies the signature BEFORE it parses the body', () => {
+  const source = readFileSync(new URL('./server.ts', import.meta.url), 'utf8')
+  const handler = source.indexOf(`define('POST', '/v1/events'`)
+  assert.ok(handler > 0, 'the handler was not found; this check is grading nothing')
+  // The slice is the handler alone: the next route definition ends it, so a `JSON.parse` belonging
+  // to some other route cannot satisfy or break this.
+  const end = source.indexOf(`    define(`, handler + 10)
+  assert.ok(end > handler, 'the handler slice has no end; this check is grading nothing')
+  const body = source.slice(handler, end)
+
+  const verifyAt = body.indexOf('verifyEventSignature(')
+  const parseAt = body.indexOf('JSON.parse')
+  assert.ok(verifyAt > 0, 'the handler no longer verifies a signature at all')
+  assert.ok(parseAt > 0, 'the handler slice contains no parse; the slice is wrong')
+  assert.ok(parseAt > verifyAt, 'the body is parsed BEFORE the signature is checked')
+  // And the bytes verified are the ones read off the socket, not a re-serialisation of a parse.
+  assert.ok(body.indexOf('readRaw(ctx.req)') < verifyAt)
 })
 
 test('a topic this service does not subscribe to is accepted and ignored', { skip }, async () => {

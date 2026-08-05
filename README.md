@@ -158,15 +158,21 @@ one of them is not refused — the token is simply never looked at.
 
 **`POST /v1/events` is the seventh, and it is different.** It takes no bearer token at all; it is
 authenticated by an **HMAC signature over the raw bytes**, checked *before* the body is parsed
-(`src/server.ts:400-409`). The header explains why the raw bytes: parsing first would make the
-signature cover a re-serialisation rather than what arrived, and would run a parser for an
-unauthenticated caller (`src/server.ts:15`). A bad signature is **401, not 403** — the caller failed
+(`src/server.ts:412-423`, and `src/server.test.ts` pins the ordering against the source so it
+cannot be reversed by a refactor). The header explains why the raw bytes: parsing first would make
+the signature cover a re-serialisation rather than what arrived, and would run a parser for an
+unauthenticated caller (`src/server.ts:14`). A bad signature is **401, not 403** — the caller failed
 to authenticate at all — and the message says nothing about which half was wrong
-(`src/server.ts:405-408`).
+(`src/server.ts:418-423`).
+
+The check accepts **every key in `OUTBOX_ACCEPT_SECRETS`**, not just the one this service signs
+with, which is what makes rotating the estate's shared outbox secret a window rather than a flag
+day; see the Configuration table. A delivery that verifies against a key other than the first is
+logged with its index, never its value (`src/server.ts:425-432`).
 
 An event on a topic this service does not subscribe to is **accepted and ignored with a 202**, never
 a 4xx: a 4xx would make the producer's relay retry, for ever, an event it is correct to send and we
-are correct not to act on (`src/server.ts:459-462`).
+are correct not to act on (`src/server.ts:483-486`).
 
 No route on this service takes an `Idempotency-Key`. The bridge's idempotency is the entitlement id,
 carried into `provisions_entitlement_uniq` and out again as the title's key
@@ -222,7 +228,8 @@ scan is the size of the backlog rather than the size of every rental ever sold
 ## Configuration
 
 `.env.example` and `src/env.ts` were cross-checked and **agree**: every variable `loadEnv` reads is
-present with its real default, and nothing extra is declared. `OUTBOX_SIGNING_SECRET` and
+present with its real default, and nothing extra is declared — including `OUTBOX_ACCEPT_SECRETS`,
+which ships commented out because its default *is* the current behaviour. `OUTBOX_SIGNING_SECRET` and
 `WORLDS_IDENTITY_CREDENTIAL` ship **empty**, so a copied file refuses to boot until they are filled
 — which is the fail-closed pattern, unlike the estate repositories that ship a long placeholder
 that clears the length check.
@@ -237,25 +244,26 @@ is logged as ignored at boot rather than silently obeyed. See `src/upstreams.ts`
 
 | Variable | Default | If it is wrong or missing |
 | --- | --- | --- |
-| `PORT` | `4000` | integer 1–65535 (`src/env.ts:171`) |
-| `NODE_ENV` | `development` | labelling only (`src/env.ts:172`) |
-| `LOG_LEVEL` | `info` | outside the four levels, boot fails (`src/env.ts:159`) |
-| `CLOUDSFORGE_TAG` | `dev` | the reported version is wrong (`src/env.ts:173`) |
-| `WORLDS_DATABASE_URL` | — | **required** (`src/env.ts:175`). Rule 1 |
-| `WORLDS_DATABASE_POOL_MAX` | `10` | 1–100 (`src/env.ts:176`) |
-| `IDENTITY_JWKS_URL` | — | **required**; unreachable → 503, never 401 (`src/env.ts:177`) |
-| `IDENTITY_ISSUER` | — | **required**; wrong → universal 401 (`src/env.ts:178`) |
-| `OUTBOX_SIGNING_SECRET` | — | **required, ≥24 chars.** It signs outbound events **and** is what `POST /v1/events` verifies inbound signatures against, so a mismatch with billing's value makes every grant event 401 and **no world is ever provisioned** (`src/env.ts:179`, use at `src/server.ts:403-393`) |
-| `INSTANCE_ID` | hostname | names this replica in `jobs.locked_by` **and in `provisions.lease_owner`** (`src/env.ts:180`) |
-| `LEDGER_URL` | — | **required**. No posting, no reward (`src/env.ts:182`) |
-| `BILLING_URL` | — | **required**. Where `GET /internal/entitlements/:userId` is asked (`src/env.ts:183`) |
+| `PORT` | `4000` | integer 1–65535 (`src/env.ts:288`) |
+| `NODE_ENV` | `development` | labelling only (`src/env.ts:289`) |
+| `LOG_LEVEL` | `info` | outside the four levels, boot fails (`src/env.ts:273`) |
+| `CLOUDSFORGE_TAG` | `dev` | the reported version is wrong (`src/env.ts:290`) |
+| `WORLDS_DATABASE_URL` | — | **required** (`src/env.ts:292`). Rule 1 |
+| `WORLDS_DATABASE_POOL_MAX` | `10` | 1–100 (`src/env.ts:293`) |
+| `IDENTITY_JWKS_URL` | — | **required**; unreachable → 503, never 401 (`src/env.ts:294`) |
+| `IDENTITY_ISSUER` | — | **required**; wrong → universal 401 (`src/env.ts:295`) |
+| `OUTBOX_SIGNING_SECRET` | — | **required, ≥24 chars.** It signs outbound events, and — unless `OUTBOX_ACCEPT_SECRETS` overrides it — it is also the one key `POST /v1/events` verifies inbound signatures against, so a mismatch with billing's value makes every grant event 401 and **no world is ever provisioned** (`src/env.ts:296`, signing use at `src/index.ts:233`) |
+| `OUTBOX_ACCEPT_SECRETS` | `[OUTBOX_SIGNING_SECRET]` | **optional; comma-separated, newest first.** Every key `POST /v1/events` will accept a signature from, which is what makes rotating the estate's shared outbox secret possible: a single key cannot be swapped, because whichever end moves first has every delivery between them refused until the other catches up, and a bridge that refuses grant events provisions nothing. Add the new key here, restart, move the producers, then drop the old one. Each entry faces the same ≥24-character and placeholder bar as the signing secret, and a repeated entry is refused — a duplicate makes "which key verified this" ambiguous, and that answer is how you know the rotation finished. A delivery that verifies against anything but the first key is logged with its `keyIndex` (`src/env.ts:297-299`, parser at `:107-127`, use at `src/server.ts:415-424`) |
+| `INSTANCE_ID` | hostname | names this replica in `jobs.locked_by` **and in `provisions.lease_owner`** (`src/env.ts:300`) |
+| `LEDGER_URL` | — | **required**. No posting, no reward (`src/env.ts:302`) |
+| `BILLING_URL` | — | **required**. Where `GET /internal/entitlements/:userId` is asked (`src/env.ts:303`) |
 | `WORLDS_IDENTITY_CREDENTIAL` | — | **≥24 chars, `cfsc_…`.** The long-lived credential exchanged at `POST /service-tokens/exchange` for a ten-minute token carrying `ledger:post` and `billing:read`. Technically optional so the image can boot for CI's `/livez` smoke test, but `/readyz` fails hard without it and every peer call 503s |
 | `IDENTITY_URL` | `IDENTITY_ISSUER` | where the credential is exchanged. Only set it where the issuer and the dialled address genuinely differ |
 | `WORLDS_SERVICE_TOKEN` | — | **retired.** A 600-second token read once at boot. If still set, boot logs that it is ignored |
-| `WORLDS_UPSTREAM_DEADLINE_MS` | `5000` | 100–60000, for ledger and billing (`src/env.ts:185`) |
-| `WORLDS_TITLE_DEADLINE_MS` | `20000` | 100–120000, **longer than the estate's other upstream deadlines deliberately**: provisioning a world writes up to four thousand tile rows in the title service, and a deadline shorter than that work **turns every provision into a retry of something that succeeded** (`src/env.ts:189`, reasoning at `:186-188`) |
-| `WORLDS_PROVISIONING_ENABLED` | `true` | set `false` to pause provisioning without pausing the service. Nothing is lost: rows sit `pending` and the sweep drains them (`src/env.ts:191`) |
-| `WORLDS_SEASON_REWARD_BUDGET_SHARDS` | `100000` | the budget a new season opens with when nobody names one. **A money control, not a tuning knob** — and deliberately small, because *a budget nobody chose should bind long before it costs anything*. Must be positive or boot fails (`src/env.ts:163-167`, `.env.example:55-61`) |
+| `WORLDS_UPSTREAM_DEADLINE_MS` | `5000` | 100–60000, for ledger and billing (`src/env.ts:309`) |
+| `WORLDS_TITLE_DEADLINE_MS` | `20000` | 100–120000, **longer than the estate's other upstream deadlines deliberately**: provisioning a world writes up to four thousand tile rows in the title service, and a deadline shorter than that work **turns every provision into a retry of something that succeeded** (`src/env.ts:313`, reasoning at `:310-312`) |
+| `WORLDS_PROVISIONING_ENABLED` | `true` | set `false` to pause provisioning without pausing the service. Nothing is lost: rows sit `pending` and the sweep drains them (`src/env.ts:315`) |
+| `WORLDS_SEASON_REWARD_BUDGET_SHARDS` | `100000` | the budget a new season opens with when nobody names one. **A money control, not a tuning knob** — and deliberately small, because *a budget nobody chose should bind long before it costs anything*. Must be positive or boot fails (`src/env.ts:281-285`, `.env.example:85-92`) |
 | `WORLDS_TEST_DATABASE_URL` | — | tests only; the name must contain `test` |
 
 ---

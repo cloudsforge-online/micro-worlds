@@ -93,6 +93,39 @@ function optionalSecret(source: Source, name: string, minLength = 24): string | 
   return value
 }
 
+/**
+ * A comma-separated list of secrets, newest first.
+ *
+ * A LIST, not a value, because rotation without an overlap window means every producer must change
+ * secret in the same instant this service does, and that instant does not exist during a rolling
+ * deploy. The receiver publishes the new key, accepts both for a window, then drops the old one.
+ *
+ * Every entry is held to exactly the bar a single secret is held to — a rotation is not an excuse
+ * to smuggle a placeholder in beside a real key. The house pattern; `devplatform/src/env.ts:103`
+ * is the reference implementation and `activity` and `notify` carry the same shape.
+ */
+function parseSecretList(raw: string, name: string, minLength = 24): readonly string[] {
+  const entries = raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+  if (entries.length === 0) throw new EnvError(`${name} is required — at least one secret`)
+  for (const entry of entries) {
+    if (PLACEHOLDERS.has(entry.toLowerCase())) {
+      throw new EnvError(`${name} contains a known placeholder — generate real secrets`)
+    }
+    if (entry.length < minLength) {
+      throw new EnvError(`${name} entries must each be at least ${minLength} characters`)
+    }
+  }
+  if (new Set(entries).size !== entries.length) {
+    // A duplicated secret makes the "which key verified this" answer ambiguous, and that answer is
+    // what tells an operator whether a rotation has finished and the old key may be dropped.
+    throw new EnvError(`${name} lists the same secret twice`)
+  }
+  return Object.freeze(entries)
+}
+
 function optional(source: Source, name: string, fallback: string): string {
   const value = source[name]?.trim()
   return value && value.length > 0 ? value : fallback
@@ -144,13 +177,35 @@ export interface Env {
   readonly identityJwksUrl: string
   readonly identityIssuer: string
   /**
-   * HMAC key for outbound event signatures — and for VERIFYING the inbound ones.
+   * HMAC key for outbound event signatures. **Signing is one key, and stays one key.**
    *
-   * The entitlement bridge is an inbound webhook, so this key is what stands between "billing said
-   * this customer bought a private world" and "anyone who can reach this port said so". A
-   * provisioning bridge with no signature check is a free-worlds endpoint.
+   * Signing with two at once would double every subscriber's verification work and leave nobody
+   * able to say which key an event was signed with. Verification is the side that needs a list —
+   * see `outboxAcceptSecrets`.
    */
   readonly outboxSigningSecret: string
+  /**
+   * Every key `POST /v1/events` will accept an inbound signature from, newest first.
+   *
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   * **ROTATION IS A WINDOW, NOT A SWAP.** `OUTBOX_SIGNING_SECRET` is one key shared by 24
+   * services. If this bridge accepted only the current value, then the moment billing moved to a
+   * new one — or the moment this service did, and billing had not yet — every grant event would
+   * 401 and **no world would be provisioned** for the length of the rolling deploy. The failure
+   * does not announce itself: delivery PARTITIONS, and the symptom reads as a secret mismatch
+   * rather than as a deploy ordering problem. Accepting a list makes the ordering irrelevant.
+   *
+   * The entitlement bridge is an inbound webhook, so these keys are what stand between "billing
+   * said this customer bought a private world" and "anyone who can reach this port said so". A
+   * provisioning bridge with no signature check is a free-worlds endpoint, which is why every
+   * entry is held to the same length and placeholder bar the single secret was.
+   *
+   * **`OUTBOX_ACCEPT_SECRETS` is OPTIONAL, and its absence means `[OUTBOX_SIGNING_SECRET]`** —
+   * exactly what every deployment does today. That is what makes shipping this change a no-op and
+   * therefore what lets the rotation be staged rather than flipped.
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  readonly outboxAcceptSecrets: readonly string[]
   readonly instanceId: string
 
   readonly ledgerUrl: string
@@ -217,6 +272,11 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   if (!LEVELS.has(logLevel)) {
     throw new EnvError(`LOG_LEVEL must be one of debug, info, warn, error (got ${logLevel})`)
   }
+  const signingSecret = requiredSecret(source, 'OUTBOX_SIGNING_SECRET')
+  // Absent means "accept exactly the key we sign with", which is what every deployment does today.
+  // The default is what makes this change a no-op to ship and therefore what lets the rotation be
+  // staged: add the new key here first, restart, move the producers, then drop the old one.
+  const acceptSecrets = source['OUTBOX_ACCEPT_SECRETS']?.trim()
   const budget = shards(source, 'WORLDS_SEASON_REWARD_BUDGET_SHARDS', 100_000n)
   if (budget <= 0n) {
     // Zero would be a season that can pay nothing, which is a configuration mistake presenting as
@@ -233,7 +293,10 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     databasePoolMax: integer(source, 'WORLDS_DATABASE_POOL_MAX', 10, 1, 100),
     identityJwksUrl: required(source, 'IDENTITY_JWKS_URL'),
     identityIssuer: required(source, 'IDENTITY_ISSUER'),
-    outboxSigningSecret: requiredSecret(source, 'OUTBOX_SIGNING_SECRET'),
+    outboxSigningSecret: signingSecret,
+    outboxAcceptSecrets: acceptSecrets
+      ? parseSecretList(acceptSecrets, 'OUTBOX_ACCEPT_SECRETS')
+      : Object.freeze([signingSecret]),
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
 
     ledgerUrl: required(source, 'LEDGER_URL'),

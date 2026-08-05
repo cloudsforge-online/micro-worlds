@@ -72,7 +72,8 @@ const server = createServer({
       queued.push({ provisionId: String((options.payload ?? {})['provisionId']) })
     },
   },
-  eventSigningSecret: SECRET,
+  // A list of one, which is what an estate with no rotation in progress configures. See `env.ts`.
+  eventAcceptSecrets: [SECRET],
 })
 
 await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))

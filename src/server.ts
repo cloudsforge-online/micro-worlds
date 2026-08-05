@@ -10,9 +10,15 @@
  *
  * A provisioning webhook with no MAC is a free-worlds endpoint: anyone who can reach the port can
  * assert that a customer bought a private world and get one raised. So the body is verified
- * against `OUTBOX_SIGNING_SECRET` over the exact bytes received, with a timing-safe comparison,
+ * against `OUTBOX_ACCEPT_SECRETS` over the exact bytes received, with a timing-safe comparison,
  * BEFORE `JSON.parse` is called on it — verifying after parsing would make the parser reachable by
  * an unauthenticated caller, and would sign a re-serialisation rather than what arrived.
+ *
+ * `OUTBOX_ACCEPT_SECRETS` is a LIST and defaults to `[OUTBOX_SIGNING_SECRET]`. A single shared key
+ * across 24 services cannot be rotated by swapping it: whichever end moves first has every
+ * delivery between them refused until the other catches up, and a bridge that refuses grant events
+ * provisions no worlds. Accepting more than one key for the length of the cutover is what makes
+ * the ordering of a rolling deploy stop mattering. Signing stays one key.
  *
  * The handler then does one thing: `withInbox` plus one INSERT. It does not call a title. A slow
  * title would otherwise make billing's relay time out and redeliver, and a bridge whose delivery
@@ -29,7 +35,6 @@
  *        fails CLOSED, with a 503.      anyway". An unverified cosmetic is never persisted.
  */
 
-import { timingSafeEqual } from 'node:crypto'
 import {
   createServer as createHttpServer,
   type IncomingMessage,
@@ -50,7 +55,7 @@ import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { JobQueue } from '@cloudsforge/jobs'
 import { SEASON_SEALED_TOPIC, handleSeasonSealed } from './heraldry.ts'
-import { SIGNATURE_HEADER, signEvent, type Db } from './outbox.ts'
+import { SIGNATURE_HEADER, verifyEventSignature, type Db } from './outbox.ts'
 import {
   isCapability,
   listTitles,
@@ -118,8 +123,14 @@ export interface ServerDeps {
   readonly rewards: RewardDeps
   readonly billing: EntitlementReader
   readonly queue: Pick<JobQueue, 'enqueue'>
-  /** Verifies inbound event signatures, and signs outbound ones. See the file header. */
-  readonly eventSigningSecret: string
+  /**
+   * Every key an inbound event signature may be verified against, newest first. See the file
+   * header, and `env.ts`'s `outboxAcceptSecrets` for why it is a list.
+   *
+   * Named for ACCEPTING rather than for signing, because that is all it does: outbound events are
+   * signed by the relay from `OUTBOX_SIGNING_SECRET` (`index.ts`), which stays a single key.
+   */
+  readonly eventAcceptSecrets: readonly string[]
   readonly beforeScrape?: () => Promise<void>
 }
 
@@ -398,16 +409,29 @@ function buildRoutes(): Route[] {
      * header.
      */
     define('POST', '/v1/events', async (ctx, deps) => {
+      // THE RAW BYTES, AND THE SIGNATURE OVER THEM, BEFORE ANYTHING PARSES ANYTHING.
       const raw = await readRaw(ctx.req)
       const presented = headerOf(ctx.req, SIGNATURE_HEADER)
-      if (!presented || !verifySignature(raw, deps.eventSigningSecret, presented)) {
+      const verified = presented
+        ? verifyEventSignature(raw.toString('utf8'), deps.eventAcceptSecrets, presented)
+        : ({ ok: false, reason: 'malformed_header' } as const)
+      if (!verified.ok) {
         deps.metrics.increment('worlds_events_rejected_total', { reason: 'bad_signature' })
         // 401 rather than 403: the caller failed to authenticate at all. The message says nothing
         // about which half was wrong.
         ctx.log.warn('an inbound event failed its signature check')
         return errorReply(401, 'bad_signature', 'the event signature did not verify', ctx.requestId)
       }
+      if (verified.keyIndex > 0) {
+        // The index, never the key. A producer still signing with a rotated-out secret is the one
+        // thing standing between "the new key is deployed" and "the old key can be deleted", and
+        // without this line the only way to find out is to delete it and see what breaks.
+        ctx.log.warn('an event verified against a rotated-out signing key', {
+          keyIndex: verified.keyIndex,
+        })
+      }
 
+      // ONLY NOW is the body parsed.
       let envelope: Record<string, unknown>
       try {
         const parsed: unknown = JSON.parse(raw.toString('utf8'))
@@ -993,18 +1017,19 @@ function readShards(value: unknown): bigint {
 }
 
 /**
- * Verify a MAC over the exact bytes received, in constant time.
+ * The MAC check lives in `outbox.ts`'s `verifyEventSignature`, which is the contract's verifier.
  *
- * Timing-safe because a byte-at-a-time comparison of a MAC is a byte-at-a-time forgery oracle: an
- * attacker who can measure the comparison can recover a valid signature one character at a time
- * without ever knowing the key.
+ * This file used to hold its own: re-sign the body and compare the two header STRINGS in constant
+ * time. Two things were wrong with it. It re-signed with `Date.now()`, so the `t=` it produced
+ * differed from the `t=` the producer signed with the moment a delivery took longer than the
+ * second it was minted in — an honest event refused, intermittently, as a forgery. And comparing
+ * whole headers rather than the digests inside them meant the freshness window in the contract's
+ * verifier was never consulted at all.
+ *
+ * The contract's verifier is still timing-safe — a byte-at-a-time comparison of a MAC is a
+ * byte-at-a-time forgery oracle — and it additionally accepts a LIST of keys, which is what makes
+ * rotating `OUTBOX_SIGNING_SECRET` possible without partitioning delivery.
  */
-function verifySignature(body: Buffer, secret: string, presented: string): boolean {
-  const expected = Buffer.from(signEvent(body.toString('utf8'), secret))
-  const actual = Buffer.from(presented)
-  if (expected.length !== actual.length) return false
-  return timingSafeEqual(expected, actual)
-}
 
 /** The raw bytes, for the signature check. Capped before buffering. */
 async function readRaw(req: IncomingMessage): Promise<Buffer> {

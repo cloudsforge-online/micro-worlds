@@ -187,9 +187,11 @@ const server = createServer({
   rewards: { sql: db, ledger, producer: SERVICE },
   billing,
   queue,
-  // The same secret signs what this service emits and verifies what billing sends. See the header
-  // of `server.ts`: an unsigned provisioning webhook is a free-worlds endpoint.
-  eventSigningSecret: env.outboxSigningSecret,
+  // Every key billing's relay may have signed with, newest first — `[OUTBOX_SIGNING_SECRET]` unless
+  // a rotation is in progress. See the header of `server.ts`: an unsigned provisioning webhook is a
+  // free-worlds endpoint, and a bridge that accepts only the newest key is one that refuses every
+  // producer still mid-deploy.
+  eventAcceptSecrets: env.outboxAcceptSecrets,
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in
   // this repository, and CI greps for one — rule 8.
   beforeScrape: async () => {

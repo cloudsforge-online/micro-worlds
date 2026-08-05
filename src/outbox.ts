@@ -17,7 +17,13 @@
  * measured conditions under which that stops being true.
  */
 
-import { EVENT_ID_HEADER, SIGNATURE_HEADER, signDelivery, verifyDelivery } from '@cloudsforge/contracts-events'
+import {
+  EVENT_ID_HEADER,
+  SIGNATURE_HEADER,
+  signDelivery,
+  verifyDelivery,
+  type DeliveryVerification,
+} from '@cloudsforge/contracts-events'
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { Sql, TransactionSql } from 'postgres'
 import { HttpClient } from '@cloudsforge/http'
@@ -128,9 +134,21 @@ export function signEvent(body: string, secret: string): string {
   return signDelivery(body, secret)
 }
 
-/** Timing-safety and the freshness window both live in the contract's verifier. */
-export function verifyEventSignature(body: string, secret: string, presented: string): boolean {
-  return verifyDelivery(body, presented, secret).ok
+/**
+ * Timing-safety, the freshness window AND multi-key rotation all live in the contract's verifier.
+ *
+ * `secrets` is a list because rotation must not require both ends to change in the same instant:
+ * the receiver publishes a new key, accepts both for a window, then drops the old one. The
+ * contract loops the candidates itself, applying the same timing-safe comparison to each, and
+ * reports `keyIndex` — which key matched. A single string is still accepted, so every existing
+ * caller reads the same.
+ */
+export function verifyEventSignature(
+  body: string,
+  secrets: string | readonly string[],
+  presented: string,
+): DeliveryVerification {
+  return verifyDelivery(body, presented, secrets)
 }
 
 /* ------------------------------------------------------------------------ relay */
