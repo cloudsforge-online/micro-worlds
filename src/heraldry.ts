@@ -17,7 +17,7 @@
  *   `inventory_items_bound_not_listed` CHECK makes the refusal structural.
  * - **`entitlement_id: 'aetherholm:season:<seasonId>:user:<userId>'`** — synthetic, PER USER,
  *   and the per-user part is load-bearing: the dedupe index is
- *   `inventory_items_entitlement_uniq (entitlement_id, item_urn)` (`src/migrations.ts:221-223`),
+ *   `inventory_items_entitlement_uniq (entitlement_id, item_urn)` (`src/migrations.ts`),
  *   so one season-wide entitlement id would let exactly ONE alliance member win the insert and
  *   hand every other member a silent null. Per-user ids give per-user idempotency across
  *   redeliveries and replicas; `grantItem` returning null is "already done" for that member.

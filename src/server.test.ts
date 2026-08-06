@@ -247,7 +247,7 @@ test('a signature over DIFFERENT bytes is refused', { skip }, async () => {
 /**
  * The ORDER is the security property, and it is pinned rather than described.
  *
- * `README.md` and `worlds-web/src/lib/worlds.ts:43` both promise this endpoint is HMAC-checked over
+ * `README.md` and `worlds-web/src/lib/worlds.ts` both promise this endpoint is HMAC-checked over
  * the exact bytes received BEFORE `JSON.parse`. Verifying after parsing would put a JSON parser in
  * front of the authentication, reachable by anyone who can open a socket, and would check a MAC
  * over a re-serialisation rather than over what arrived — and `JSON.parse` then `JSON.stringify` is

@@ -111,7 +111,7 @@ test('a reward is a BALANCED LEDGER POSTING, not a column somewhere', { skip }, 
   // This assertion used to read `platform` / `expense`, which was a live defect rather than a
   // preference: micro-market and micro-trade credit the same (platform, SHARD, fees) key as
   // `revenue`, and the ledger THROWS AccountConflictError on a type disagreement
-  // (ledger/src/accounts.ts:125) — whichever service posted second would have had every entry
+  // (ledger/src/accounts.ts) — whichever service posted second would have had every entry
   // refused. `equity` also denies the account the overdraft exemption that `clearing` and
   // `suspense` get, so an unfunded engagement account refuses the reward at the ledger.
   assert.equal(postings[0]?.direction, 'debit')
@@ -458,7 +458,7 @@ test('a budget cannot be lowered below what has already been paid', { skip }, as
  * and `reward_budget_shards` is now a **spending limit on real platform money**. Doc 21 is
  * explicit about what that makes it: §6 lists `engagement.policy.set` as "required to raise, not
  * to lower", §7.7 requires the asymmetry to be proven by test, and
- * `admin-api/src/migrations.ts:512` already enforces it on `engagement_policies`. A re-open that
+ * `admin-api/src/migrations.ts` already enforces it on `engagement_policies`. A re-open that
  * raised the cap with no approval and no record contradicted all three — and did it through the
  * same call an operator makes to correct a season's name.
  *

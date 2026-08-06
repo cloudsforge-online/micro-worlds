@@ -338,7 +338,7 @@ const toSeason = (row: SeasonRow): Season => ({
  * push an end date silently raised that limit to whatever the request carried.
  *
  * Doc 21 §6 makes raising an engagement cap an approved act and lowering one free, §7.7 requires
- * that asymmetry to be proven by test, and `admin-api/src/migrations.ts:512` already enforces it
+ * that asymmetry to be proven by test, and `admin-api/src/migrations.ts` already enforces it
  * on `engagement_policies` with a trigger. This is the same rule about the same money, so it is
  * the same mechanism: `seasons_budget_raise_needs_approval` refuses an increase that does not name
  * a fresh approval, and it refuses it against a hand-run UPDATE as well as against this function.

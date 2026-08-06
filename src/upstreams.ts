@@ -7,7 +7,7 @@
  * is wiring no test can reach. `index.ts` opens a pool, asserts a schema and calls `listen()`;
  * importing it from a test starts a server. So the line that was wrong —
  *
- *     const token = () => env.serviceToken        // index.ts:80, for months
+ *     const token = () => env.serviceToken        // index.ts, for months
  *
  * — was structurally untestable, and a suite full of tests that build their own clients could not
  * have caught it however carefully they were written. A test that constructs its own provider
@@ -16,7 +16,7 @@
  *
  * ── THE TEN-MINUTE CLIFF ───────────────────────────────────────────────────────────────────────
  *
- * A service token expires in 600 seconds (`SERVICE_TTL_SECONDS`, identity/src/tokens.ts:33). This
+ * A service token expires in 600 seconds (`SERVICE_TTL_SECONDS`, identity/src/tokens.ts). This
  * service read one once at boot, and nothing re-minted it — nothing could, because minting
  * required the `admin` role. Ten minutes into every deployment, the ledger and billing began
  * refusing every call, and no test here could see it because a test mints a token and uses it
