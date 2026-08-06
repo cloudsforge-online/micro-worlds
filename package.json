@@ -1,12 +1,14 @@
 {
   "name": "@cloudsforge/worlds",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "The game platform. A title registry, account-scoped player profiles, cross-title inventory with a bound flag the schema enforces, achievements, seasons, budget-capped rewards that are ledger postings, and the entitlement bridge that finally provisions the private world the estate already sells.",
   "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@11.9.0",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node --import tsx src/index.ts",
     "migrate": "node --import tsx src/migrator.ts",
