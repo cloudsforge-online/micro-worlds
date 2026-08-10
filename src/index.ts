@@ -50,7 +50,7 @@ logger.info('starting', {
   provisioningEnabled: env.provisioningEnabled,
   // Said at boot, because a bridge that is switched off looks exactly like a bridge that is broken
   // until somebody reads the environment.
-  seasonRewardBudgetShards: env.seasonRewardBudgetShards.toString(),
+  seasonRewardBudgetWei: env.seasonRewardBudgetWei.toString(),
 })
 
 // 3. The database pool. Opened before the schema assertion for the obvious reason that the

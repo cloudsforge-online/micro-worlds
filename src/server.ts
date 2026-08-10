@@ -769,7 +769,7 @@ function buildRoutes(): Route[] {
         body: {
           achievements: achievements.map((achievement) => ({
             ...achievement,
-            rewardShards: achievement.rewardShards.toString(),
+            rewardWei: achievement.rewardWei.toString(),
           })),
         },
       }
@@ -788,11 +788,11 @@ function buildRoutes(): Route[] {
         name: requireString(body, 'name'),
         description: typeof body['description'] === 'string' ? body['description'] : '',
         points: typeof body['points'] === 'number' ? body['points'] : 0,
-        rewardShards: readShards(body['rewardShards'] ?? '0'),
+        rewardWei: readWei(body['rewardWei'] ?? '0'),
       })
       return {
         status: 200,
-        body: { achievement: { ...achievement, rewardShards: achievement.rewardShards.toString() } },
+        body: { achievement: { ...achievement, rewardWei: achievement.rewardWei.toString() } },
       }
     }),
 
@@ -834,7 +834,7 @@ function buildRoutes(): Route[] {
         name: requireString(body, 'name'),
         startsAt: new Date(requireString(body, 'startsAt')),
         endsAt: new Date(requireString(body, 'endsAt')),
-        rewardBudgetShards: readShards(body['rewardBudgetShards']),
+        rewardBudgetWei: readWei(body['rewardBudgetWei']),
         ...(typeof body['status'] === 'string' ? { status: body['status'] as 'active' } : {}),
         // The approval that authorises a RAISE, when this call raises the cap. Absent, and a raise
         // is refused by the database; present and already used, likewise. Lowering never needs it.
@@ -853,9 +853,9 @@ function buildRoutes(): Route[] {
       return {
         status: 200,
         body: {
-          budgetShards: budget.budget.toString(),
-          grantedShards: budget.granted.toString(),
-          remainingShards: budget.remaining.toString(),
+          budgetWei: budget.budget.toString(),
+          grantedWei: budget.granted.toString(),
+          remainingWei: budget.remaining.toString(),
         },
       }
     }),
@@ -880,7 +880,7 @@ function buildRoutes(): Route[] {
           seasonId: itemIdOf(ctx),
           userId: requireString(body, 'userId'),
           reason: requireString(body, 'reason'),
-          amountShards: readShards(body['amountShards']),
+          amountWei: readWei(body['amountWei']),
           actor: actorOf(principal),
           correlationId: ctx.requestId,
         })
@@ -894,7 +894,7 @@ function buildRoutes(): Route[] {
               id: grant.id,
               userId: grant.userId,
               reason: grant.reason,
-              amountShards: grant.amountShards.toString(),
+              amountWei: grant.amountWei.toString(),
               journalEntryId: grant.journalEntryId,
             },
             replayed: grant.replayed,
@@ -944,8 +944,8 @@ function toSeasonWire(season: {
   startsAt: Date
   endsAt: Date
   status: string
-  rewardBudgetShards: bigint
-  rewardsGrantedShards: bigint
+  rewardBudgetWei: bigint
+  rewardsGrantedWei: bigint
   budgetRaiseApprovalId: string | null
 }): Record<string, unknown> {
   return {
@@ -957,8 +957,8 @@ function toSeasonWire(season: {
     endsAt: season.endsAt.toISOString(),
     status: season.status,
     // Strings, always. A budget is money.
-    rewardBudgetShards: season.rewardBudgetShards.toString(),
-    rewardsGrantedShards: season.rewardsGrantedShards.toString(),
+    rewardBudgetWei: season.rewardBudgetWei.toString(),
+    rewardsGrantedWei: season.rewardsGrantedWei.toString(),
     // Named, not hidden. A spending limit that was raised should say what raised it; 21 §4's
     // premise is that the programme can be reconstructed by somebody who was not in the room.
     budgetRaiseApprovalId: season.budgetRaiseApprovalId,
@@ -1004,14 +1004,22 @@ function requireString(body: Record<string, unknown>, field: string): string {
 }
 
 /**
- * A Shard amount, as a decimal STRING.
+ * A quantity of EMBER wei, as a decimal STRING.
  *
- * A number is refused rather than coerced. A budget and a reward are money, and the habit of
- * sending amounts as JSON numbers is how an amount loses its low bits somewhere else in the estate.
+ * A number is refused rather than coerced, and the reason got sharper when the unit moved. A
+ * budget and a reward are money, and the habit of sending amounts as JSON numbers is how an
+ * amount loses its low bits somewhere else in the estate — but at 18 decimals every reward worth
+ * paying is already past `Number.MAX_SAFE_INTEGER`, so a JSON number here would not merely risk
+ * the low bits, it would routinely lose them.
+ *
+ * Wei and not a decimal EMBER string, on both directions of the wire: smallest units are the only
+ * form that survives a round trip without a rounding rule, and this service is not the one that
+ * knows EMBER's decimals — `chainSpec` lives in contracts-chain and the client that renders the
+ * figure applies it.
  */
-function readShards(value: unknown): bigint {
+function readWei(value: unknown): bigint {
   if (typeof value !== 'string' || !/^\d{1,78}$/.test(value)) {
-    throw new BadRequestError('a shard amount must be a decimal string of up to 78 digits')
+    throw new BadRequestError('an EMBER amount must be a decimal string of up to 78 digits of wei')
   }
   return BigInt(value)
 }

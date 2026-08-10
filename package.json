@@ -31,9 +31,18 @@
     "sources. On publish their publishConfig points at dist/, tsx moves to devDependencies, and the",
     "image runs 'node dist/index.js'."
   ],
+  "_contractsChain": [
+    "A DIRECT dependency although @cloudsforge/contracts-money already pulls it in, because this",
+    "service names IssuableAssetCode itself (src/ledgerclient.ts, REWARD_ASSET). A type reached",
+    "through a transitive is a type this manifest has not asked for, and pnpm's node_modules is",
+    "not flat — the import resolves only while contracts-money happens to be installed the way it",
+    "is today. Declared, so the reward asset cannot stop compiling because of somebody else's",
+    "dependency edit."
+  ],
   "dependencies": {
     "@cloudsforge/auth": "link:../runtime/packages/auth",
     "@cloudsforge/contracts-auth": "link:../contracts/packages/auth",
+    "@cloudsforge/contracts-chain": "link:../contracts/packages/chain",
     "@cloudsforge/contracts-money": "link:../contracts/packages/money",
     "@cloudsforge/contracts-events": "link:../contracts/packages/events",
     "@cloudsforge/db": "link:../runtime/packages/db",

@@ -176,21 +176,35 @@ test('OUTBOX_ACCEPT_SECRETS listing the same secret twice is refused', () => {
 })
 
 test('the season reward budget is read as a bigint, never through Number', () => {
-  const env = loadEnv({ ...BASE, WORLDS_SEASON_REWARD_BUDGET_SHARDS: '9007199254740993' }, 'host')
-  assert.equal(env.seasonRewardBudgetShards, 9_007_199_254_740_993n)
+  // Well past Number.MAX_SAFE_INTEGER, and in wei that is a rounding error rather than an exotic
+  // case: one EMBER is 1e18 wei, so ANY realistic budget is outside the double range.
+  const env = loadEnv({ ...BASE, WORLDS_SEASON_REWARD_BUDGET_WEI: '9007199254740993' }, 'host')
+  assert.equal(env.seasonRewardBudgetWei, 9_007_199_254_740_993n)
+})
+
+test('the default season reward budget is 4,000 EMBER', () => {
+  // Not a relabelling of the 100,000 Shards this used to default to: 100 Shards to the USD and
+  // EMBER administered at 0.25 USD makes USD 1,000 either way. See the derivation in env.ts.
+  assert.equal(loadEnv(BASE, 'host').seasonRewardBudgetWei, 4_000_000_000_000_000_000_000n)
 })
 
 test('a zero reward budget is refused: a season that can pay nothing is a mistake', () => {
-  assert.throws(
-    () => loadEnv({ ...BASE, WORLDS_SEASON_REWARD_BUDGET_SHARDS: '0' }, 'host'),
-    /positive/,
-  )
+  assert.throws(() => loadEnv({ ...BASE, WORLDS_SEASON_REWARD_BUDGET_WEI: '0' }, 'host'), /positive/)
 })
 
 test('a non-numeric budget is refused rather than defaulted', () => {
   assert.throws(
-    () => loadEnv({ ...BASE, WORLDS_SEASON_REWARD_BUDGET_SHARDS: 'lots' }, 'host'),
-    /whole number of shards/,
+    () => loadEnv({ ...BASE, WORLDS_SEASON_REWARD_BUDGET_WEI: 'lots' }, 'host'),
+    /whole number of wei/,
+  )
+})
+
+test('the retired WORLDS_SEASON_REWARD_BUDGET_SHARDS is refused, not ignored', () => {
+  // Accepting-and-ignoring it would run the default budget while the deployment believes it set
+  // one, and the two numbers differ by 4e16 — the Shard-to-wei rate — not by nothing.
+  assert.throws(
+    () => loadEnv({ ...BASE, WORLDS_SEASON_REWARD_BUDGET_SHARDS: '100000' }, 'host'),
+    /retired with the asset it names/,
   )
 })
 
