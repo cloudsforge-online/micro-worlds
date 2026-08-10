@@ -137,6 +137,13 @@ variable. Migration 11 renames the columns and multiplies any Shard-era figure b
 1 Shard = 1 US cent = 0.04 EMBER at EMBER's administered price, both rates frozen into the migration
 because a migration runs once and is checksummed afterwards.
 
+**One exception, deliberate.** `PUT /v1/titles/:id/achievements` still accepts a `rewardShards` and
+converts it, because that route's wire document is `AchievementDefinition` in
+`@cloudsforge/contracts-worlds` and micro-emberkin and micro-nda send it on every catalogue sync.
+Renaming the field there would turn four repositories this change does not own red at once. It
+costs nothing today — both senders hard-code a reward of zero — and it exists so the first title to
+ship a non-zero one is read at the right scale rather than dropped to zero (`src/server.ts`).
+
 ---
 
 ## Routes

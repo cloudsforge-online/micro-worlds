@@ -788,7 +788,7 @@ function buildRoutes(): Route[] {
         name: requireString(body, 'name'),
         description: typeof body['description'] === 'string' ? body['description'] : '',
         points: typeof body['points'] === 'number' ? body['points'] : 0,
-        rewardWei: readWei(body['rewardWei'] ?? '0'),
+        rewardWei: readAchievementReward(body),
       })
       return {
         status: 200,
@@ -1022,6 +1022,45 @@ function readWei(value: unknown): bigint {
     throw new BadRequestError('an EMBER amount must be a decimal string of up to 78 digits of wei')
   }
   return BigInt(value)
+}
+
+/**
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE ONE ROUTE WHERE THE OLD SPELLING IS STILL ACCEPTED, AND WHY IT IS THIS ONE.**
+ *
+ * `PUT /v1/titles/:id/achievements` is not called by an operator or by a web client. It is called
+ * by TITLE SERVICES, against a shared wire document — `AchievementDefinition` in
+ * `@cloudsforge/contracts-worlds` — whose field is still spelled for Shards. micro-emberkin and
+ * micro-nda both build that document with `serialiseAchievementDefinition` and send it on every
+ * catalogue sync. Renaming the field in the contract would turn four repositories this change does
+ * not own red at once, which is the one thing #226's fix may not do; the same rule micro-ledger's
+ * own retired-asset guard is bounded by, and for the same reason.
+ *
+ * So this route reads `rewardWei` and, when it is absent, converts a `rewardShards` at the rate
+ * migration 11 freezes — one Shard is 4e16 wei. Not a silent tolerance: an amount arrives meaning
+ * the same money either way, rather than being read at the wrong scale or dropped to zero.
+ *
+ * It costs nothing today. Both live senders hard-code a reward of `0n`, which is why all 47
+ * achievements on mainnet have a zero reward (measured 2026-08-10). The conversion exists for the
+ * title that ships a non-zero one before its repository moves.
+ *
+ * **REMOVE IT** when `contracts/packages/worlds` renames the field and emberkin, nda, tessera and
+ * aetherholm are on the new spelling. Until then, deleting this makes a Shard-era definition a
+ * reward of zero with no error anywhere, which is worse than the name it is trying to retire.
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ */
+const WEI_PER_SHARD = 40_000_000_000_000_000n
+
+function readAchievementReward(body: Record<string, unknown>): bigint {
+  if (body['rewardWei'] !== undefined) return readWei(body['rewardWei'])
+  if (body['rewardShards'] === undefined) return 0n
+  const converted = readWei(body['rewardShards']) * WEI_PER_SHARD
+  // `readWei` accepts the 78 digits the column holds, and the conversion adds seventeen more. A
+  // 400 here rather than a numeric field overflow reaching the caller as a 500.
+  if (converted >= 10n ** 78n) {
+    throw new BadRequestError('rewardShards is too large to express in wei — send rewardWei')
+  }
+  return converted
 }
 
 /**

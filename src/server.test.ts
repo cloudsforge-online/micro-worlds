@@ -636,6 +636,43 @@ test('an ADMIN re-opening a season cannot raise its budget without an approval',
   assert.equal(approvedBody['budgetRaiseApprovalId'], 'approval-4e1a')
 })
 
+/* ------------------------------------------- the achievement definition a title still sends */
+
+test('a title still speaking rewardShards is converted, not read at the wrong scale', { skip }, async () => {
+  // The one surface #226 could not rename in lockstep. `AchievementDefinition` in
+  // @cloudsforge/contracts-worlds still spells this field for Shards, micro-emberkin and micro-nda
+  // both send it on every catalogue sync, and neither repository is this change's to move — so the
+  // route converts at migration 11's rate instead of dropping the amount to zero. Both spellings
+  // are asserted, because a compatibility path nobody tests is a compatibility path that rots.
+  const title = await registerTitle(db, 'worlds', {
+    slug: 'ashfall',
+    name: 'Ashfall',
+    status: 'live',
+    serviceUrl: 'http://127.0.0.1:9001',
+    capabilities: ['achievements'],
+    assetScopes: [],
+    actor: 'operator:test',
+    correlationId: 'req-1',
+  })
+
+  const legacy = await call(`/v1/titles/${title.id}/achievements`, {
+    method: 'PUT',
+    token: 'svc-title',
+    body: { key: 'first_blood', name: 'First Blood', points: 10, rewardShards: '25' },
+  })
+  assert.equal(legacy.status, 200)
+  // 25 Shards is 25 US cents is 1 EMBER.
+  assert.equal((legacy.body['achievement'] as Record<string, unknown>)['rewardWei'], '1000000000000000000')
+
+  const current = await call(`/v1/titles/${title.id}/achievements`, {
+    method: 'PUT',
+    token: 'svc-title',
+    body: { key: 'first_blood', name: 'First Blood', points: 10, rewardWei: '2000000000000000000' },
+  })
+  assert.equal(current.status, 200)
+  assert.equal((current.body['achievement'] as Record<string, unknown>)['rewardWei'], '2000000000000000000')
+})
+
 /* ------------------------------------------------------------------ shape */
 
 test('a malformed id is a 404, not a 500 from Postgres', { skip }, async () => {
