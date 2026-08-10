@@ -12,8 +12,8 @@
  * incremented in place — `work.tokens += locked.rewardTokens` — with no entry anywhere and no
  * possibility of reconciliation. It is survivable only because those tokens are a dead currency:
  * nothing spends them, and their only consumer is one achievement trigger. The moment a reward is
- * worth a Shard, and a Shard is one US cent funded by an on-chain deposit, an unreconciled
- * increment is a hole in the money.
+ * worth EMBER wei — a balance a player can withdraw to a chain — an unreconciled increment is a
+ * hole in the money.
  *
  * **The cap.** There is no cap of any kind there: no daily, weekly, seasonal or global issuance
  * budget, no counter, no alert. `grantXp` loops levels with no ceiling. So a bug that grants an
@@ -28,7 +28,7 @@
  *
  * ## The ordering inside `grantReward`, which is the part that is easy to get backwards
  *
- *   1. Increment `rewards_granted_shards` FIRST, under the CHECK. If the season cannot afford it,
+ *   1. Increment `rewards_granted_wei` FIRST, under the CHECK. If the season cannot afford it,
  *      the transaction fails here — before the ledger has been asked for anything. Posting first
  *      and capping second would move real money and then decline to record it.
  *   2. Post to the ledger, inside the transaction, with a derived key.
@@ -42,6 +42,7 @@
 import type { Db } from './outbox.ts'
 import { withOutbox } from './outbox.ts'
 import {
+  REWARD_ASSET,
   rewardIdempotencyKey,
   rewardPostings,
   type LedgerClient,
@@ -63,7 +64,7 @@ export class BudgetExceededError extends RewardError {
   readonly remaining: bigint
   constructor(seasonId: string, remaining: bigint, requested: bigint) {
     super(
-      `this season's reward budget has ${remaining} shards left and the grant asks for ${requested}`,
+      `this season's reward budget has ${remaining} wei of EMBER left and the grant asks for ${requested}`,
     )
     this.name = 'BudgetExceededError'
     this.seasonId = seasonId
@@ -84,7 +85,7 @@ export class BudgetRaiseNeedsApprovalError extends RewardError {
   readonly slug: string
   constructor(titleId: string, slug: string, requested: bigint) {
     super(
-      `raising this season's reward budget to ${requested} shards needs an approved ` +
+      `raising this season's reward budget to ${requested} wei of EMBER needs an approved ` +
         'engagement.policy.set approval id; lowering it does not (21 §7.7)',
     )
     this.name = 'BudgetRaiseNeedsApprovalError'
@@ -102,7 +103,7 @@ export interface Achievement {
   readonly name: string
   readonly description: string
   readonly points: number
-  readonly rewardShards: bigint
+  readonly rewardWei: bigint
 }
 
 interface AchievementRow {
@@ -112,10 +113,10 @@ interface AchievementRow {
   readonly name: string
   readonly description: string
   readonly points: number
-  readonly reward_shards: string
+  readonly reward_wei: string
 }
 
-const ACHIEVEMENT_COLUMNS = `id, title_id, key, name, description, points, reward_shards`
+const ACHIEVEMENT_COLUMNS = `id, title_id, key, name, description, points, reward_wei`
 
 const toAchievement = (row: AchievementRow): Achievement => ({
   id: row.id,
@@ -124,7 +125,7 @@ const toAchievement = (row: AchievementRow): Achievement => ({
   name: row.name,
   description: row.description,
   points: row.points,
-  rewardShards: BigInt(row.reward_shards),
+  rewardWei: BigInt(row.reward_wei),
 })
 
 /**
@@ -143,20 +144,20 @@ export async function defineAchievement(
     readonly name: string
     readonly description?: string
     readonly points?: number
-    readonly rewardShards?: bigint
+    readonly rewardWei?: bigint
   },
 ): Promise<Achievement> {
   const rows = await sql<AchievementRow[]>`
-    insert into achievements (title_id, key, name, description, points, reward_shards)
+    insert into achievements (title_id, key, name, description, points, reward_wei)
     values (
       ${input.titleId}, ${input.key}, ${input.name}, ${input.description ?? ''},
-      ${input.points ?? 0}, ${(input.rewardShards ?? 0n).toString()}::numeric
+      ${input.points ?? 0}, ${(input.rewardWei ?? 0n).toString()}::numeric
     )
     on conflict (title_id, key) do update set
       name = excluded.name,
       description = excluded.description,
       points = excluded.points,
-      reward_shards = excluded.reward_shards
+      reward_wei = excluded.reward_wei
     returning ${sql.unsafe(ACHIEVEMENT_COLUMNS)}
   `
   const row = rows[0]
@@ -232,7 +233,12 @@ export async function unlockAchievement(
         achievementKey: achievement.key,
         name: achievement.name,
         points: achievement.points,
-        rewardShards: achievement.rewardShards.toString(),
+        rewardWei: achievement.rewardWei.toString(),
+        // Named for the same reason as on `worlds.reward.granted`, and named even though this
+        // event does not pay: an unlock announces what the achievement is WORTH, and a worth
+        // without a unit is the defect #226 exists about. `rewardWei` is 0 on all 47 achievements
+        // defined on mainnet as of 2026-08-10, so no consumer sees a figure change here.
+        assetCode: REWARD_ASSET,
       },
       actor: input.actor,
       correlationId: input.correlationId,
@@ -248,7 +254,7 @@ export async function listUnlocked(
 ): Promise<Array<{ achievement: Achievement; unlockedAt: Date }>> {
   const rows = titleId
     ? await sql<(AchievementRow & { unlocked_at: Date })[]>`
-        select a.id, a.title_id, a.key, a.name, a.description, a.points, a.reward_shards,
+        select a.id, a.title_id, a.key, a.name, a.description, a.points, a.reward_wei,
                pa.unlocked_at
           from player_achievements pa
           join achievements a on a.id = pa.achievement_id
@@ -256,7 +262,7 @@ export async function listUnlocked(
          order by pa.unlocked_at desc
       `
     : await sql<(AchievementRow & { unlocked_at: Date })[]>`
-        select a.id, a.title_id, a.key, a.name, a.description, a.points, a.reward_shards,
+        select a.id, a.title_id, a.key, a.name, a.description, a.points, a.reward_wei,
                pa.unlocked_at
           from player_achievements pa
           join achievements a on a.id = pa.achievement_id
@@ -278,8 +284,8 @@ export interface Season {
   readonly startsAt: Date
   readonly endsAt: Date
   readonly status: SeasonStatus
-  readonly rewardBudgetShards: bigint
-  readonly rewardsGrantedShards: bigint
+  readonly rewardBudgetWei: bigint
+  readonly rewardsGrantedWei: bigint
   /**
    * The approval that authorised the CURRENT budget, or null if it has never been raised.
    *
@@ -298,14 +304,14 @@ interface SeasonRow {
   readonly starts_at: Date
   readonly ends_at: Date
   readonly status: string
-  readonly reward_budget_shards: string
-  readonly rewards_granted_shards: string
+  readonly reward_budget_wei: string
+  readonly rewards_granted_wei: string
   readonly budget_raise_approval_id: string | null
 }
 
 const SEASON_COLUMNS = `
-  id, title_id, slug, name, starts_at, ends_at, status, reward_budget_shards,
-  rewards_granted_shards, budget_raise_approval_id
+  id, title_id, slug, name, starts_at, ends_at, status, reward_budget_wei,
+  rewards_granted_wei, budget_raise_approval_id
 `
 
 const toSeason = (row: SeasonRow): Season => ({
@@ -316,8 +322,8 @@ const toSeason = (row: SeasonRow): Season => ({
   startsAt: row.starts_at,
   endsAt: row.ends_at,
   status: row.status as SeasonStatus,
-  rewardBudgetShards: BigInt(row.reward_budget_shards),
-  rewardsGrantedShards: BigInt(row.rewards_granted_shards),
+  rewardBudgetWei: BigInt(row.reward_budget_wei),
+  rewardsGrantedWei: BigInt(row.rewards_granted_wei),
   budgetRaiseApprovalId: row.budget_raise_approval_id,
 })
 
@@ -331,9 +337,9 @@ const toSeason = (row: SeasonRow): Season => ({
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **RE-OPENING MAY LOWER THE BUDGET FREELY AND MAY RAISE IT ONLY WITH AN APPROVAL.**
  *
- * `reward_budget_shards` stopped being a game-balance number in migration 9: the season is funded
+ * `reward_budget_wei` stopped being a game-balance number in migration 9: the season is funded
  * from `engagement:worlds`, rewards debit that account, so the budget is a **spending limit on
- * real platform money**. This function used to assign `reward_budget_shards` unconditionally in
+ * real platform money**. This function used to assign `reward_budget_wei` unconditionally in
  * its ON CONFLICT branch, which meant the ordinary act of re-opening a season to fix a name or
  * push an end date silently raised that limit to whatever the request carried.
  *
@@ -350,7 +356,7 @@ const toSeason = (row: SeasonRow): Season => ({
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 export async function openSeason(sql: Db, input: OpenSeasonInput): Promise<Season> {
-  if (input.rewardBudgetShards <= 0n) {
+  if (input.rewardBudgetWei <= 0n) {
     throw new RewardError('a season needs a positive reward budget')
   }
   const rows = await upsertSeason(sql, input)
@@ -365,7 +371,7 @@ export interface OpenSeasonInput {
   readonly name: string
   readonly startsAt: Date
   readonly endsAt: Date
-  readonly rewardBudgetShards: bigint
+  readonly rewardBudgetWei: bigint
   readonly status?: SeasonStatus
   /**
    * The `engagement.policy.set` approval authorising a RAISE, when this re-open raises the cap.
@@ -381,11 +387,11 @@ async function upsertSeason(sql: Db, input: OpenSeasonInput): Promise<SeasonRow[
   try {
     return await sql<SeasonRow[]>`
       insert into seasons (
-        title_id, slug, name, starts_at, ends_at, status, reward_budget_shards
+        title_id, slug, name, starts_at, ends_at, status, reward_budget_wei
       ) values (
         ${input.titleId}, ${input.slug}, ${input.name}, ${input.startsAt.toISOString()}::timestamptz,
         ${input.endsAt.toISOString()}::timestamptz, ${input.status ?? 'upcoming'},
-        ${input.rewardBudgetShards.toString()}::numeric
+        ${input.rewardBudgetWei.toString()}::numeric
       )
       on conflict (title_id, slug) do update set
         name = excluded.name,
@@ -396,7 +402,7 @@ async function upsertSeason(sql: Db, input: OpenSeasonInput): Promise<SeasonRow[
         -- which refuses a budget below what the season has already paid — lowering a budget cannot
         -- un-pay a reward. RAISING reaches seasons_budget_raise_needs_approval, which refuses it
         -- unless the line below carries a fresh approval id.
-        reward_budget_shards = excluded.reward_budget_shards,
+        reward_budget_wei = excluded.reward_budget_wei,
         -- coalesce, never excluded alone: a re-open that says nothing about approvals must not
         -- blank the id that authorised the budget the season already has, or that id becomes
         -- reusable. The trigger pins it back to its old value on any change that is not a raise.
@@ -408,7 +414,7 @@ async function upsertSeason(sql: Db, input: OpenSeasonInput): Promise<SeasonRow[
     `
   } catch (err: unknown) {
     if (isRaiseWithoutApproval(err)) {
-      throw new BudgetRaiseNeedsApprovalError(input.titleId, input.slug, input.rewardBudgetShards)
+      throw new BudgetRaiseNeedsApprovalError(input.titleId, input.slug, input.rewardBudgetWei)
     }
     throw err
   }
@@ -456,7 +462,7 @@ export interface GrantRewardInput {
   readonly userId: string
   /** The achievement key, objective id or campaign name. Part of the idempotency key. */
   readonly reason: string
-  readonly amountShards: bigint
+  readonly amountWei: bigint
   readonly actor: string
   readonly correlationId: string
 }
@@ -466,7 +472,7 @@ export interface RewardGrant {
   readonly seasonId: string
   readonly userId: string
   readonly reason: string
-  readonly amountShards: bigint
+  readonly amountWei: bigint
   readonly journalEntryId: string
   readonly replayed: boolean
 }
@@ -478,15 +484,17 @@ export async function grantReward(
   deps: RewardDeps,
   input: GrantRewardInput,
 ): Promise<RewardGrant> {
-  if (input.amountShards <= 0n) throw new RewardError('a reward must be a positive number of shards')
+  if (input.amountWei <= 0n) {
+    throw new RewardError('a reward must be a positive number of wei')
+  }
   const key = rewardIdempotencyKey(input.seasonId, input.userId, input.reason)
 
   return withOutbox(deps.sql, deps.producer, async (tx, emit) => {
     // An already-paid reward is returned rather than paid again. Checked first so the common
     // retry costs one SELECT rather than a ledger round trip.
     const existing = await tx<
-      { id: string; amount_shards: string; journal_entry_id: string }[]
-    >`select id, amount_shards, journal_entry_id from reward_grants where idempotency_key = ${key}`
+      { id: string; amount_wei: string; journal_entry_id: string }[]
+    >`select id, amount_wei, journal_entry_id from reward_grants where idempotency_key = ${key}`
     const already = existing[0]
     if (already) {
       return {
@@ -494,7 +502,7 @@ export async function grantReward(
         seasonId: input.seasonId,
         userId: input.userId,
         reason: input.reason,
-        amountShards: BigInt(already.amount_shards),
+        amountWei: BigInt(already.amount_wei),
         journalEntryId: already.journal_entry_id,
         replayed: true,
       }
@@ -505,10 +513,10 @@ export async function grantReward(
     //    The CHECK constraint is the backstop for anything that reaches this table another way.
     const charged = await tx<SeasonRow[]>`
       update seasons
-         set rewards_granted_shards = rewards_granted_shards + ${input.amountShards.toString()}::numeric,
+         set rewards_granted_wei = rewards_granted_wei + ${input.amountWei.toString()}::numeric,
              updated_at = now()
        where id = ${input.seasonId}
-         and rewards_granted_shards + ${input.amountShards.toString()}::numeric <= reward_budget_shards
+         and rewards_granted_wei + ${input.amountWei.toString()}::numeric <= reward_budget_wei
       returning ${tx.unsafe(SEASON_COLUMNS)}
     `
     const season = charged[0]
@@ -521,8 +529,8 @@ export async function grantReward(
       const parsed = toSeason(row)
       throw new BudgetExceededError(
         parsed.id,
-        parsed.rewardBudgetShards - parsed.rewardsGrantedShards,
-        input.amountShards,
+        parsed.rewardBudgetWei - parsed.rewardsGrantedWei,
+        input.amountWei,
       )
     }
 
@@ -535,17 +543,17 @@ export async function grantReward(
       correlationId: input.correlationId,
       idempotencyKey: key,
       description: `worlds: ${input.reason}`,
-      postings: rewardPostings({ subject: `user:${input.userId}`, amount: input.amountShards }),
+      postings: rewardPostings({ subject: `user:${input.userId}`, amount: input.amountWei }),
     })
 
     // 3. The local record, naming the entry. NOT NULL in the schema, because a reward with no
     //    entry is a payment that exists only in this service's opinion.
     const rows = await tx<{ id: string }[]>`
       insert into reward_grants (
-        season_id, user_id, title_id, reason, amount_shards, journal_entry_id, idempotency_key
+        season_id, user_id, title_id, reason, amount_wei, journal_entry_id, idempotency_key
       ) values (
         ${input.seasonId}, ${input.userId}, ${season.title_id}, ${input.reason},
-        ${input.amountShards.toString()}::numeric, ${entry.id}, ${key}
+        ${input.amountWei.toString()}::numeric, ${entry.id}, ${key}
       )
       returning id
     `
@@ -561,12 +569,31 @@ export async function grantReward(
         titleId: season.title_id,
         userId: input.userId,
         reason: input.reason,
-        amountShards: input.amountShards.toString(),
+        amountWei: input.amountWei.toString(),
+        // ══════════════════════════════════════════════════════════════════════════════════════
+        // **THE ASSET IS ON THE EVENT NOW, AND THE FIGURE SAYS WHAT SCALE IT IS IN.** #226.
+        //
+        // This payload used to carry `amountShards` and no asset code at all, which left every
+        // consumer to supply the unit from the field NAME. `activity/src/classify.ts` says what
+        // that costs, and it says it about this exact topic: "A quantity with no unit is not a
+        // smaller version of the truth" — so it refuses to quantify a reward until a producer
+        // names the asset, and its `seasonRewardSummary` carries a deliberately dead asset-code
+        // branch waiting for this field. Naming it is the producer's half of that bargain.
+        //
+        // The amount field is renamed in the same breath rather than kept, and the two changes
+        // have to travel together. A consumer reading `amountShards` off a payload that now
+        // means wei would render a figure eighteen orders of magnitude out beside the code this
+        // line adds. Renaming it makes that read return nothing, and every consumer of this
+        // topic degrades to a sentence that names the reward without quantifying it — which is
+        // the behaviour both `activity` and `notify/src/catalogue.ts` already implement for a
+        // figure they cannot safely state.
+        // ══════════════════════════════════════════════════════════════════════════════════════
+        assetCode: REWARD_ASSET,
         journalEntryId: entry.id,
         // The budget after this grant, on the event. An alert on "the season is nearly spent" is
         // then a subscriber rather than a query somebody has to remember to write.
-        budgetRemainingShards: (
-          BigInt(season.reward_budget_shards) - BigInt(season.rewards_granted_shards)
+        budgetRemainingWei: (
+          BigInt(season.reward_budget_wei) - BigInt(season.rewards_granted_wei)
         ).toString(),
       },
       actor: input.actor,
@@ -578,7 +605,7 @@ export async function grantReward(
       seasonId: input.seasonId,
       userId: input.userId,
       reason: input.reason,
-      amountShards: input.amountShards,
+      amountWei: input.amountWei,
       journalEntryId: entry.id,
       replayed: entry.replayed,
     }
@@ -593,8 +620,8 @@ export async function seasonBudget(
   const season = await findSeason(sql, seasonId)
   if (!season) return null
   return {
-    budget: season.rewardBudgetShards,
-    granted: season.rewardsGrantedShards,
-    remaining: season.rewardBudgetShards - season.rewardsGrantedShards,
+    budget: season.rewardBudgetWei,
+    granted: season.rewardsGrantedWei,
+    remaining: season.rewardBudgetWei - season.rewardsGrantedWei,
   }
 }

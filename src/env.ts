@@ -13,7 +13,7 @@
  *   2. **A known placeholder is refused outright.** A default secret in source is not convenient,
  *      it is catastrophic, and a placeholder that boots is a placeholder that reaches production.
  *
- * ## `WORLDS_SEASON_REWARD_BUDGET_SHARDS` is a money control, not a tuning knob
+ * ## `WORLDS_SEASON_REWARD_BUDGET_WEI` is a money control, not a tuning knob
  *
  * Rewards are ledger postings. A game exploit that mints rewards is therefore a MONEY INCIDENT and
  * not a balance complaint, and the only thing standing between "a bug pays out" and "a bug pays
@@ -173,16 +173,18 @@ function integer(source: Source, name: string, fallback: number, min: number, ma
 }
 
 /**
- * A Shard quantity as a decimal string, never a number.
+ * A quantity of EMBER wei as a decimal string, never a number.
  *
  * A budget is money. Reading it through `Number()` would make a large one approximate, and an
  * approximate cap is a cap that is either slightly too generous or refuses a legitimate grant —
- * both of which are discovered by a customer rather than by a test.
+ * both of which are discovered by a customer rather than by a test. At 18 decimals the smallest
+ * budget worth setting is already past `Number.MAX_SAFE_INTEGER`, so this is no longer a
+ * precaution against an unusually large figure; it is the only reading that works at all.
  */
-function shards(source: Source, name: string, fallback: bigint): bigint {
+function wei(source: Source, name: string, fallback: bigint): bigint {
   const raw = source[name]?.trim()
   if (!raw) return fallback
-  if (!/^\d+$/.test(raw)) throw new EnvError(`${name} must be a whole number of shards (got ${raw})`)
+  if (!/^\d+$/.test(raw)) throw new EnvError(`${name} must be a whole number of wei (got ${raw})`)
   return BigInt(raw)
 }
 
@@ -295,12 +297,12 @@ export interface Env {
   readonly provisioningEnabled: boolean
 
   /**
-   * The default reward budget a new season is opened with, in Shards.
+   * The default reward budget a new season is opened with, in EMBER wei.
    *
    * A season may be given its own on creation; this is what one gets when nobody says. It is
    * deliberately small — a budget nobody chose should bind long before it costs anything.
    */
-  readonly seasonRewardBudgetShards: bigint
+  readonly seasonRewardBudgetWei: bigint
 }
 
 const LEVELS = new Set(['debug', 'info', 'warn', 'error'])
@@ -315,11 +317,35 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   // The default is what makes this change a no-op to ship and therefore what lets the rotation be
   // staged: add the new key here first, restart, move the producers, then drop the old one.
   const acceptSecrets = source['OUTBOX_ACCEPT_SECRETS']?.trim()
-  const budget = shards(source, 'WORLDS_SEASON_REWARD_BUDGET_SHARDS', 100_000n)
+  // ════════════════════════════════════════════════════════════════════════════════════════════
+  // WORLDS_SEASON_REWARD_BUDGET_SHARDS IS GONE RATHER THAN ACCEPTED-AND-IGNORED. micro-org#226.
+  //
+  // The same shape micro-mint used when it retired MINT_DEPLOY_PRICE_SHARDS, and for the same
+  // reason: a deployment that still sets the old name is asserting a budget in a unit this build
+  // no longer has, and silently falling back to the default below would be a budget nobody chose
+  // presented as one somebody did. It is refused where the variable is named.
+  //
+  // No deployment sets either name today — checked against the RUNNING container on 2026-08-10,
+  // `docker inspect cloudsforge-estate-worlds-1`: neither variable is in its environment, so
+  // mainnet has always run on the default and this refusal cannot fire there.
+  // ════════════════════════════════════════════════════════════════════════════════════════════
+  if ((source['WORLDS_SEASON_REWARD_BUDGET_SHARDS'] ?? '').trim().length > 0) {
+    throw new EnvError(
+      'WORLDS_SEASON_REWARD_BUDGET_SHARDS is retired with the asset it names. Set ' +
+        'WORLDS_SEASON_REWARD_BUDGET_WEI instead — it is EMBER wei, so the same money is a ' +
+        'different number (21 §2, micro-org#226)',
+    )
+  }
+  // 4,000 EMBER, which is the 100,000 Shards this defaulted to before #226, converted at the two
+  // recorded rates rather than relabelled: 100 Shards to the USD (SHARDS_PER_USD) makes it USD
+  // 1,000, and EMBER's administered price of 0.25 USD (pricing.administered_prices, usd_scaled
+  // 250000, unchanged since 2026-08-04 and read again on 2026-08-10) makes that 4,000 EMBER. The
+  // literal is grouped so a reader can count the eighteen zeroes without trusting an exponent.
+  const budget = wei(source, 'WORLDS_SEASON_REWARD_BUDGET_WEI', 4_000_000_000_000_000_000_000n)
   if (budget <= 0n) {
     // Zero would be a season that can pay nothing, which is a configuration mistake presenting as
     // "every reward is refused". Refused here, where the variable is named.
-    throw new EnvError('WORLDS_SEASON_REWARD_BUDGET_SHARDS must be positive')
+    throw new EnvError('WORLDS_SEASON_REWARD_BUDGET_WEI must be positive')
   }
 
   return {
@@ -351,7 +377,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     titleDeadlineMs: integer(source, 'WORLDS_TITLE_DEADLINE_MS', 20_000, 100, 120_000),
 
     provisioningEnabled: boolean(source, 'WORLDS_PROVISIONING_ENABLED', true),
-    seasonRewardBudgetShards: budget,
+    seasonRewardBudgetWei: budget,
   }
 }
 

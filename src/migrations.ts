@@ -36,8 +36,9 @@
  *                            This table is the record that closes that.
  *
  *   `seasons.rewards_        A budget cap, checked by the database. Rewards are ledger postings,
- *   granted_shards`          so a game exploit that mints rewards is a money incident. The frozen
- *                            service has no cap of any kind.
+ *   granted_wei`             so a game exploit that mints rewards is a money incident. The frozen
+ *                            service has no cap of any kind. Named `..._shards` until migration
+ *                            11 moved the programme to EMBER — micro-org#226.
  * ---------------------------------------------------------------------------------------------
  */
 
@@ -479,6 +480,140 @@ export const MIGRATIONS: readonly Migration[] = [
       $$;
 
       drop trigger if exists seasons_budget_raise_needs_approval on seasons;
+      create trigger seasons_budget_raise_needs_approval
+        before update on seasons
+        for each row execute function seasons_budget_raise_needs_approval();
+    `,
+  },
+
+  {
+    version: 11,
+    name: 'rewards_in_ember_wei',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      -- **THIS SERVICE'S HALF OF THE ENGAGEMENT PROGRAMME MOVES OFF A RETIRED ASSET.**
+      -- micro-org#226.
+      --
+      -- Migration 9 made a season's budget a claim on 'engagement:worlds' and pointed rewards at
+      -- that account as their debit side. It left the unit alone, and the unit was SHARD —
+      -- retired on 2026-08-04 (contracts/packages/chain, RETIRED_ASSETS; assertIssuable refuses
+      -- it by name). So the programme was funded in one asset and spent in another: docs 21 §3
+      -- funds 'platform:engagement-treasury' with MINED EMBER arriving through the front door,
+      -- and §2 has said 'bounded, disclosed, and denominated in EMBER' since 2026-08-07. A grant
+      -- paid in Shards could not be reconstructed against that funding, which is #226's title.
+      --
+      -- ── WHY THIS IS SAFE TO DO AS A RENAME, MEASURED RATHER THAN ASSUMED ─────────────────
+      --
+      -- Live mainnet, 2026-08-10, read off cloudsforge-estate-postgres-1:
+      --
+      --     achievements                47 rows, EVERY ONE with reward_shards = 0
+      --     seasons                      0 rows
+      --     reward_grants                0 rows
+      --     ledger accounts matching 'engagement'                              0
+      --     ledger postings of kind reward_granted, in any asset               0
+      --
+      -- Not one unit has ever moved through this machinery. There is no balance to convert and
+      -- no history to restate, which is why the columns are RENAMED rather than added beside the
+      -- old ones and back-filled: expand/contract exists to protect data in flight, and there is
+      -- none. A second set of columns would instead leave two spellings of one budget, which is
+      -- the shape #226 §4 warns about for the account key.
+      --
+      -- ── THE CONVERSION, AND ITS RATE, FOR ANY ENVIRONMENT THAT IS NOT MAINNET ───────────
+      --
+      -- #226 §4 is explicit that this is not a relabelling: SHARD has 0 decimals and EMBER has
+      -- 18, so the same integer means two things eighteen orders of magnitude apart. The update
+      -- below is therefore a real conversion at a decided rate, composed of two facts each
+      -- recorded elsewhere:
+      --
+      --     one Shard is exactly one US cent   the documented peg, SHARDS_PER_USD = 100
+      --                                        (contracts/packages/chain), and the identity
+      --                                        micro-mint's migration 6 relied on
+      --     one EMBER is 0.25 USD              pricing.administered_prices, usd_scaled 250000
+      --                                        against RATE_SCALE 1e6, set_by null, unchanged
+      --                                        since 2026-08-04 15:05 UTC — read on 2026-08-10
+      --
+      -- so one Shard is 0.04 EMBER, and 0.04e18 = 40000000000000000 wei. On mainnet this
+      -- multiplies 47 zeroes by a constant and moves nothing; it exists so a development or test
+      -- database carrying Shard-era figures comes out the other side meaning the same money
+      -- rather than a number eighteen orders too small.
+      --
+      -- The rate is FROZEN INTO THIS MIGRATION on purpose. EMBER's price is administered — one
+      -- operator-editable row — and a stored figure that re-reads it restates itself every time
+      -- somebody edits that number. A migration is the one place the rate may appear, because a
+      -- migration runs once and is checksummed afterwards.
+      --
+      -- ── WHAT DOES NOT CHANGE ─────────────────────────────────────────────────────────────
+      --
+      -- Every constraint, index and trigger below keeps its rule and its strength; only the
+      -- column it names moves. numeric(78,0) already held wei-scale values (it is what
+      -- admin-api's own seed_per_market_wei uses), so no type changes and nothing widens.
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+
+      -- ── THE TRIGGER COMES OFF FIRST, FOR TWO REASONS, BOTH MEASURED ─────────────────────
+      --
+      -- Neither was reasoned about: the replay test in migrations.test.ts brings a scratch
+      -- schema to version 10, writes Shard-era rows and applies this migration to them, and it
+      -- is what refused each of these in turn.
+      --
+      --   1. plpgsql resolves record fields at EXECUTION time, so migration 10's function body
+      --      still names the old column and raises 'record "new" has no field
+      --      "reward_budget_shards"' on the first update after the renames below.
+      --   2. Even with the body rebuilt first, the conversion multiplies every budget by 4e16 —
+      --      which IS a raise as far as the guard is concerned, and it would refuse the
+      --      migration's own UPDATE for naming no approval.
+      --
+      -- So the guard comes off, the data is restated, and the guard goes back on with its rule
+      -- unchanged. The window is inside one migration, which is inside one transaction.
+      drop trigger if exists seasons_budget_raise_needs_approval on seasons;
+
+      alter table achievements  rename column reward_shards          to reward_wei;
+      alter table seasons       rename column reward_budget_shards   to reward_budget_wei;
+      alter table seasons       rename column rewards_granted_shards to rewards_granted_wei;
+      alter table reward_grants rename column amount_shards          to amount_wei;
+
+      -- 100 Shards to the dollar and 0.25 USD to the EMBER: 1 Shard = 4e16 wei. See above.
+      update achievements  set reward_wei          = reward_wei          * 40000000000000000;
+      update seasons       set reward_budget_wei   = reward_budget_wei   * 40000000000000000,
+                               rewards_granted_wei = rewards_granted_wei * 40000000000000000;
+      update reward_grants set amount_wei          = amount_wei          * 40000000000000000;
+
+      -- Postgres carries a CHECK across a column rename, so these are renamed for the reader
+      -- rather than rebuilt: a constraint called '..._shards' on a column called '..._wei' is a
+      -- refusal message that names the wrong unit at the moment somebody is debugging money.
+      alter table achievements  rename constraint achievements_reward_non_negative
+                                               to achievements_reward_wei_non_negative;
+      alter table seasons       rename constraint seasons_budget_positive
+                                               to seasons_budget_wei_positive;
+      alter table seasons       rename constraint seasons_within_budget
+                                               to seasons_within_budget_wei;
+      alter table reward_grants rename constraint reward_grants_amount_positive
+                                               to reward_grants_amount_wei_positive;
+
+      -- The rule is unchanged and is restated here in full because 'create or replace function'
+      -- has no partial form.
+      create or replace function seasons_budget_raise_needs_approval() returns trigger
+      language plpgsql as $$
+      begin
+        -- Unchanged from migration 10, which argues it: lowering is free and is floored by
+        -- seasons_within_budget_wei, and the approval id is pinned back so a call that does not
+        -- raise cannot burn one.
+        if new.reward_budget_wei <= old.reward_budget_wei then
+          new.budget_raise_approval_id := old.budget_raise_approval_id;
+          return new;
+        end if;
+
+        if new.budget_raise_approval_id is null
+           or new.budget_raise_approval_id is not distinct from old.budget_raise_approval_id then
+          raise exception
+            'seasons_budget_raise_needs_approval: raising a season reward budget from % to % requires a fresh approved engagement.policy.set approval; lowering does not (21 §7.7)',
+            old.reward_budget_wei, new.reward_budget_wei
+            using errcode = 'check_violation';
+        end if;
+        return new;
+      end;
+      $$;
+
+      -- Back on, with the same timing and the same rule migration 10 gave it.
       create trigger seasons_budget_raise_needs_approval
         before update on seasons
         for each row execute function seasons_budget_raise_needs_approval();

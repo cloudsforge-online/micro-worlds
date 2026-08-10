@@ -261,7 +261,7 @@ export function openDb(max = 8): postgres.Sql {
  *
  * Deliberately runs the real `MIGRATIONS` rather than a hand-written fixture schema. A fixture
  * would let the constraints drift out of the tests that are supposed to prove they fire — and two
- * of them, `inventory_items_bound_not_listed` and `seasons_within_budget`, are the two most
+ * of them, `inventory_items_bound_not_listed` and `seasons_within_budget_wei`, are the two most
  * important lines in this repository.
  */
 export async function migrateTestDb(sql: postgres.Sql): Promise<void> {

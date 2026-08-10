@@ -99,14 +99,14 @@ There is also **no cap of any kind there**: no daily, weekly, seasonal or global
 counter, no alert; `grantXp` loops levels with no ceiling. So a bug granting an objective twice per
 tick grants it for ever, bounded only by how long it takes somebody to notice.
 
-Here the budget is a column, the check is `seasons_within_budget`, and the increment happens in the
+Here the budget is a column, the check is `seasons_within_budget_wei`, and the increment happens in the
 **same transaction** as the grant — so it cannot be spent past by application-level cleverness, by a
 second replica, or by a hand-run UPDATE. The transaction simply fails to commit. **That is the
 difference between a control and an intention.**
 
 The ordering inside `grantReward` is the part easy to get backwards (`src/rewards.ts`):
 
-1. increment `rewards_granted_shards` **first**, under the CHECK — if the season cannot afford it
+1. increment `rewards_granted_wei` **first**, under the CHECK — if the season cannot afford it
    the transaction fails **before the ledger has been asked for anything**. Posting first and
    capping second would move real money and then decline to record it;
 2. post to the ledger, inside the transaction, with a **derived** key;
@@ -115,6 +115,34 @@ The ordering inside `grantReward` is the part easy to get backwards (`src/reward
 A crash anywhere rolls all three back, and the retry **replays** the ledger entry rather than
 posting a second one. A crash between 2 and 3 is the dangerous one, and the derived key is what
 makes it safe.
+
+### The asset is EMBER, on both legs, and it used to be SHARD
+
+micro-org#226. Migration 9 made a season's budget a claim on `engagement:worlds` and pointed rewards
+at that account as their debit side, but left the unit alone — and the unit was `SHARD`, retired
+from the estate on 2026-08-04 (`contracts/packages/chain`, `RETIRED_ASSETS`). So the programme was
+**funded in one asset and spent in another**: `docs/ecosystem/21-engagement-treasury.md` §3 funds
+the engagement treasury with mined EMBER arriving as an ordinary deposit, and §2 has read
+"denominated in EMBER" since 2026-08-07.
+
+The old spelling was not merely mislabelled, it was **inert**: `engagement:worlds` in SHARD can
+never be funded, because the ledger's own retired-asset guard refuses a SHARD deposit and there is
+no SHARD chain to deposit from — and `equity` gets none of the overdraft exemption `clearing` and
+`suspense` have, so the first real grant would have been refused at the ledger. Nothing had ever
+run through it: on mainnet, 2026-08-10, 47 achievements all with a zero reward, no seasons, no
+grants, no engagement account and not one `reward_granted` posting in any asset.
+
+Everything therefore reads **wei of EMBER** — the columns, the wire, the events, the environment
+variable. Migration 11 renames the columns and multiplies any Shard-era figure by 4e16, which is
+1 Shard = 1 US cent = 0.04 EMBER at EMBER's administered price, both rates frozen into the migration
+because a migration runs once and is checksummed afterwards.
+
+**One exception, deliberate.** `PUT /v1/titles/:id/achievements` still accepts a `rewardShards` and
+converts it, because that route's wire document is `AchievementDefinition` in
+`@cloudsforge/contracts-worlds` and micro-emberkin and micro-nda send it on every catalogue sync.
+Renaming the field there would turn four repositories this change does not own red at once. It
+costs nothing today — both senders hard-code a reward of zero — and it exists so the first title to
+ship a non-zero one is read at the right scale rather than dropped to zero (`src/server.ts`).
 
 ---
 
@@ -148,9 +176,9 @@ Four scopes: `worlds:read`, `worlds:write`, `worlds:title` and `worlds:admin`
 | `PUT` | `/v1/titles/:id/achievements` | service with `worlds:title` | a title declares its achievements (`src/server.ts`) |
 | `POST` | `/v1/titles/:id/achievements/unlock` | service with `worlds:title` | a title reports an unlock (`src/server.ts`) |
 | `GET` | `/v1/titles/:id/seasons` | **no auth** | the seasons (`src/server.ts`) |
-| `POST` | `/v1/titles/:id/seasons` | admin; service needs `worlds:admin` | opens a season **with a budget**, or re-opens the one with that slug. The budget is a spending limit on `engagement:worlds`, so **lowering it is free and raising it needs `budgetRaiseApprovalId`** — a raise without one is `422 budget_raise_needs_approval` (`src/server.ts`) |
-| `GET` | `/v1/seasons/:id/budget` | user or admin; service needs `worlds:read` | budget and consumption (`src/server.ts`) |
-| `POST` | `/v1/seasons/:id/rewards` | service with `worlds:title` | grants a reward — a ledger posting under the cap (`src/server.ts`) |
+| `POST` | `/v1/titles/:id/seasons` | admin; service needs `worlds:admin` | opens a season **with a budget**, or re-opens the one with that slug. `rewardBudgetWei` is a decimal string of EMBER wei. The budget is a spending limit on `engagement:worlds`, so **lowering it is free and raising it needs `budgetRaiseApprovalId`** — a raise without one is `422 budget_raise_needs_approval` (`src/server.ts`) |
+| `GET` | `/v1/seasons/:id/budget` | user or admin; service needs `worlds:read` | budget and consumption, as `budgetWei`/`grantedWei`/`remainingWei` (`src/server.ts`) |
+| `POST` | `/v1/seasons/:id/rewards` | service with `worlds:title` | grants a reward — a ledger posting under the cap. `amountWei` is a decimal string of EMBER wei; a JSON number is refused rather than rounded (`src/server.ts`) |
 
 **Six routes make no `authenticate()` call**: `/livez`, `/readyz`, `/metrics`, `GET /v1/titles`,
 `GET /v1/titles/:id/achievements` and `GET /v1/titles/:id/seasons`. A client that sends a token to
@@ -210,7 +238,7 @@ scan is the size of the backlog rather than the size of every rental ever sold
 | Constraint | Refuses | Why it is here rather than in a handler |
 | --- | --- | --- |
 | `inventory_items_bound_not_listed` — `not (bound and listed_at is not null)` | selling anything that confers power | **the anti-pay-to-win control.** A rule in a route is a rule the next route forgets — and the frozen estate relies on three independent *conventions* instead: a catalogue policy, a trade engine that happens to be type-closed over resources, and the fact that entitlements have no transfer path. **Every one of those is a property of what has not been built yet** (`src/migrations.ts`, reasoning) |
-| `seasons_within_budget` — `rewards_granted_shards <= reward_budget_shards` | minting rewards past the season's budget | **rewards are ledger postings, so a game exploit that mints them is a money incident rather than a balance complaint.** Enforced by the database, in the same transaction as the grant, so no application-level cleverness, no second replica and no hand-run UPDATE can spend past it (`src/migrations.ts`, reasoning) |
+| `seasons_within_budget_wei` — `rewards_granted_wei <= reward_budget_wei` | minting rewards past the season's budget | **rewards are ledger postings, so a game exploit that mints them is a money incident rather than a balance complaint.** Enforced by the database, in the same transaction as the grant, so no application-level cleverness, no second replica and no hand-run UPDATE can spend past it (`src/migrations.ts`, reasoning) |
 | `provisions_entitlement_uniq` on `entitlement_id` | provisioning one entitlement twice | **the idempotency of the whole bridge**: one entitlement provisions one thing, for ever, however many times the event is redelivered and however many replicas consume it (`src/migrations.ts`, reasoning) |
 | `provisions.title_id` has **NO foreign key** | — | **deliberate, and found by a test.** A FK made the INSERT fail with 23503 → the webhook answered 500 → billing's relay redelivered for ever → **and the purchase was never recorded at all.** That is exactly the class of defect this table exists to end: a customer's money moves and nothing in the platform knows. Recording a purchase must never depend on the registry being up to date; an unregistered title becomes an `unsupported` row an operator can read and act on (`src/migrations.ts`, behaviour at `src/provisioning.ts`) |
 | `provisions_provisioned_is_complete` | `state = 'provisioned'` with no `provisioned_urn` | **a row that claims delivery and cannot say of what is exactly the state the frozen estate leaves a customer in** (`src/migrations.ts`) |
@@ -220,8 +248,8 @@ scan is the size of the backlog rather than the size of every rental ever sold
 | `inventory_items_listing_complete` — `(listed_at is null) = (listing_urn is null)` | a half-recorded listing | "listed" is two columns and one fact (`src/migrations.ts`) |
 | `inventory_items_entitlement_uniq`, **partial** `where entitlement_id is not null` | one entitlement granting an item twice | partial, because most items have no entitlement behind them (`src/migrations.ts`) |
 | `reward_grants_key_uniq` on `idempotency_key` | a doubled reward | pairs with the derived ledger key so a retry replays rather than posts again (`src/migrations.ts`) |
-| `seasons_budget_raise_needs_approval` (trigger) + `seasons_budget_raise_approval_uniq` | **raising** a season's reward budget without naming a fresh approval — including by re-opening the season, and including a hand-run `UPDATE` | since migration 9 a season is funded from `engagement:worlds`, so `reward_budget_shards` is a **spending limit on real platform money**. `docs/ecosystem/21-engagement-treasury.md` §6 makes raising an engagement cap an approved act and lowering one free; §7.7 requires that asymmetry be proven by test; `admin-api/src/migrations.ts` already enforces it on `engagement_policies`. `openSeason`'s ON CONFLICT branch used to assign the budget unconditionally, so the ordinary re-open — the one that corrects a name — silently raised the cap. **A trigger and not a CHECK** because the rule is about the *direction* of a change and a CHECK cannot see the old row. The approval id is `text` with no FK: `approvals` is admin-api's table, so this is a cross-service reference like `reward_grants.journal_entry_id` (`src/migrations.ts`, uniqueness, reasoning — including what it does **not** cover) |
-| `seasons_dates_ordered`, `seasons_budget_positive`, `achievements_points_sane` (0–1000) | inverted seasons, a zero budget, absurd point values | (`src/migrations.ts`) |
+| `seasons_budget_raise_needs_approval` (trigger) + `seasons_budget_raise_approval_uniq` | **raising** a season's reward budget without naming a fresh approval — including by re-opening the season, and including a hand-run `UPDATE` | since migration 9 a season is funded from `engagement:worlds`, so `reward_budget_wei` is a **spending limit on real platform money**. `docs/ecosystem/21-engagement-treasury.md` §6 makes raising an engagement cap an approved act and lowering one free; §7.7 requires that asymmetry be proven by test; `admin-api/src/migrations.ts` already enforces it on `engagement_policies`. `openSeason`'s ON CONFLICT branch used to assign the budget unconditionally, so the ordinary re-open — the one that corrects a name — silently raised the cap. **A trigger and not a CHECK** because the rule is about the *direction* of a change and a CHECK cannot see the old row. The approval id is `text` with no FK: `approvals` is admin-api's table, so this is a cross-service reference like `reward_grants.journal_entry_id` (`src/migrations.ts`, uniqueness, reasoning — including what it does **not** cover) |
+| `seasons_dates_ordered`, `seasons_budget_wei_positive`, `achievements_points_sane` (0–1000) | inverted seasons, a zero budget, absurd point values | (`src/migrations.ts`) |
 
 ---
 
@@ -263,7 +291,8 @@ is logged as ignored at boot rather than silently obeyed. See `src/upstreams.ts`
 | `WORLDS_UPSTREAM_DEADLINE_MS` | `5000` | 100–60000, for ledger and billing (`src/env.ts`) |
 | `WORLDS_TITLE_DEADLINE_MS` | `20000` | 100–120000, **longer than the estate's other upstream deadlines deliberately**: provisioning a world writes up to four thousand tile rows in the title service, and a deadline shorter than that work **turns every provision into a retry of something that succeeded** (`src/env.ts`, reasoning) |
 | `WORLDS_PROVISIONING_ENABLED` | `true` | set `false` to pause provisioning without pausing the service. Nothing is lost: rows sit `pending` and the sweep drains them (`src/env.ts`) |
-| `WORLDS_SEASON_REWARD_BUDGET_SHARDS` | `100000` | the budget a new season opens with when nobody names one. **A money control, not a tuning knob** — and deliberately small, because *a budget nobody chose should bind long before it costs anything*. Must be positive or boot fails (`src/env.ts`, `.env.example:85-92`) |
+| `WORLDS_SEASON_REWARD_BUDGET_WEI` | `4000000000000000000000` | the budget a new season opens with when nobody names one, in **EMBER wei**. 4,000 EMBER — the same USD 1,000 the retired Shard default meant, converted rather than relabelled. **A money control, not a tuning knob** — and deliberately small, because *a budget nobody chose should bind long before it costs anything*. Must be positive or boot fails (`src/env.ts`) |
+| `WORLDS_SEASON_REWARD_BUDGET_SHARDS` | — | **retired with the asset it names** (micro-org#226). Refused at boot rather than ignored: the replacement is wei, so the same money is a different number and a silent fall-back to the default would be a budget nobody chose presented as one somebody did (`src/env.ts`) |
 | `WORLDS_TEST_DATABASE_URL` | — | tests only; the name must contain `test` |
 
 ---

@@ -79,7 +79,7 @@ async function aSeason(budget = 1_000n): Promise<string> {
     name: 'Season One',
     startsAt: new Date('2026-01-01T00:00:00Z'),
     endsAt: new Date('2026-04-01T00:00:00Z'),
-    rewardBudgetShards: budget,
+    rewardBudgetWei: budget,
     status: 'active',
   })
   return season.id
@@ -95,7 +95,7 @@ test('a reward is a BALANCED LEDGER POSTING, not a column somewhere', { skip }, 
     seasonId,
     userId: ALICE,
     reason: 'first_blood',
-    amountShards: 100n,
+    amountWei: 100n,
     actor: `service:worlds`,
     correlationId: 'req-2',
   })
@@ -124,6 +124,47 @@ test('a reward is a BALANCED LEDGER POSTING, not a column somewhere', { skip }, 
   assert.ok(grant.journalEntryId)
 })
 
+test('BOTH LEGS ARE EMBER — the funding and the payment are one asset', { skip }, async () => {
+  // micro-org#226 in one assertion. These read 'SHARD' until 2026-08-10, which made the entry
+  // unreconstructable in two ways at once: the treasury doc (21 §2) denominates the programme in
+  // EMBER, so the funding side and the spending side named different assets; and SHARD is retired
+  // (contracts-chain RETIRED_ASSETS), so `engagement:worlds` in SHARD can never be funded at all
+  // — the ledger's own retired_asset_guard refuses a SHARD deposit, and `equity` gets no overdraft
+  // exemption. Asserted on BOTH postings rather than on the entry, because an entry whose legs
+  // disagree about the asset is exactly the shape this issue is about.
+  const seasonId = await aSeason()
+  await grantReward(deps(), {
+    seasonId,
+    userId: ALICE,
+    reason: 'first_blood',
+    amountWei: 100n,
+    actor: 'service:worlds',
+    correlationId: 'req-2',
+  })
+  const postings = ledger.entries[0]?.postings ?? []
+  assert.equal(postings[0]?.account.assetCode, 'EMBER')
+  assert.equal(postings[1]?.account.assetCode, 'EMBER')
+})
+
+test('the granted event names the asset it paid in', { skip }, async () => {
+  // A consumer reading an amount with no asset code beside it has to guess, and the guess that
+  // was right before #226 (Shards, 0 decimals) is now wrong by eighteen orders of magnitude.
+  const seasonId = await aSeason()
+  await grantReward(deps(), {
+    seasonId,
+    userId: ALICE,
+    reason: 'first_blood',
+    amountWei: 100n,
+    actor: 'service:worlds',
+    correlationId: 'req-2',
+  })
+  const rows = await sql<{ payload: { assetCode?: string; amountWei?: string } }[]>`
+    select payload from outbox where topic = 'worlds.reward.granted'
+  `
+  assert.equal(rows[0]?.payload.assetCode, 'EMBER')
+  assert.equal(rows[0]?.payload.amountWei, '100')
+})
+
 test('the local record names the entry that paid it', { skip }, async () => {
   // A reward with no entry is a payment that exists only in this service's opinion.
   const seasonId = await aSeason()
@@ -131,7 +172,7 @@ test('the local record names the entry that paid it', { skip }, async () => {
     seasonId,
     userId: ALICE,
     reason: 'first_blood',
-    amountShards: 100n,
+    amountWei: 100n,
     actor: 'service:worlds',
     correlationId: 'req-2',
   })
@@ -159,7 +200,7 @@ test('a season cannot be spent past its budget, however many times it is asked',
       seasonId,
       userId: ALICE,
       reason: `objective_${i}`,
-      amountShards: 50n,
+      amountWei: 50n,
       actor: 'service:worlds',
       correlationId: `req-${i}`,
     })
@@ -171,7 +212,7 @@ test('a season cannot be spent past its budget, however many times it is asked',
         seasonId,
         userId: ALICE,
         reason: 'objective_5',
-        amountShards: 50n,
+        amountWei: 50n,
         actor: 'service:worlds',
         correlationId: 'req-5',
       }),
@@ -193,7 +234,7 @@ test('a refused reward asks the ledger for NOTHING', { skip }, async () => {
         seasonId,
         userId: ALICE,
         reason: 'jackpot',
-        amountShards: 1_000n,
+        amountWei: 1_000n,
         actor: 'service:worlds',
         correlationId: 'req-2',
       }),
@@ -211,7 +252,7 @@ test('the refusal says how much is left, so a caller can act on it', { skip }, a
     seasonId,
     userId: ALICE,
     reason: 'a',
-    amountShards: 90n,
+    amountWei: 90n,
     actor: 'service:worlds',
     correlationId: 'req-2',
   })
@@ -221,7 +262,7 @@ test('the refusal says how much is left, so a caller can act on it', { skip }, a
         seasonId,
         userId: BOB,
         reason: 'b',
-        amountShards: 50n,
+        amountWei: 50n,
         actor: 'service:worlds',
         correlationId: 'req-3',
       }),
@@ -236,7 +277,7 @@ test('two concurrent grants cannot both spend the last of a budget', { skip }, a
       seasonId,
       userId: ALICE,
       reason: 'a',
-      amountShards: 100n,
+      amountWei: 100n,
       actor: 'service:worlds',
       correlationId: 'req-2',
     }),
@@ -244,7 +285,7 @@ test('two concurrent grants cannot both spend the last of a budget', { skip }, a
       seasonId,
       userId: BOB,
       reason: 'b',
-      amountShards: 100n,
+      amountWei: 100n,
       actor: 'service:worlds',
       correlationId: 'req-3',
     }),
@@ -262,7 +303,7 @@ test('the same reward asked twice pays once', { skip }, async () => {
     seasonId,
     userId: ALICE,
     reason: 'first_blood',
-    amountShards: 100n,
+    amountWei: 100n,
     actor: 'service:worlds',
     correlationId: 'req-2',
   })
@@ -270,7 +311,7 @@ test('the same reward asked twice pays once', { skip }, async () => {
     seasonId,
     userId: ALICE,
     reason: 'first_blood',
-    amountShards: 100n,
+    amountWei: 100n,
     actor: 'service:worlds',
     correlationId: 'req-3',
   })
@@ -283,7 +324,7 @@ test('the same reward asked twice pays once', { skip }, async () => {
 
 test('an unreachable ledger rolls the budget back', { skip }, async () => {
   // The budget is charged first, inside the same transaction, so a ledger that cannot be reached
-  // leaves the season exactly as it was rather than having quietly spent a hundred shards.
+  // leaves the season exactly as it was rather than having quietly spent a hundred wei.
   const seasonId = await aSeason()
   ledger.failNext(new LedgerUnavailableError('connect ECONNREFUSED'))
   await assert.rejects(() =>
@@ -291,7 +332,7 @@ test('an unreachable ledger rolls the budget back', { skip }, async () => {
       seasonId,
       userId: ALICE,
       reason: 'first_blood',
-      amountShards: 100n,
+      amountWei: 100n,
       actor: 'service:worlds',
       correlationId: 'req-2',
     }),
@@ -309,11 +350,11 @@ test('a zero or negative reward is refused', { skip }, async () => {
         seasonId,
         userId: ALICE,
         reason: 'nothing',
-        amountShards: 0n,
+        amountWei: 0n,
         actor: 'service:worlds',
         correlationId: 'req-2',
       }),
-    /positive number of shards/,
+    /positive number of wei/,
   )
 })
 
@@ -403,7 +444,7 @@ test('a season is a ROW per title, so a second season is possible', { skip }, as
     name: 'Season One',
     startsAt: new Date('2026-01-01T00:00:00Z'),
     endsAt: new Date('2026-04-01T00:00:00Z'),
-    rewardBudgetShards: 1_000n,
+    rewardBudgetWei: 1_000n,
   })
   const two = await openSeason(db, {
     titleId,
@@ -411,10 +452,10 @@ test('a season is a ROW per title, so a second season is possible', { skip }, as
     name: 'Season Two',
     startsAt: new Date('2026-04-01T00:00:00Z'),
     endsAt: new Date('2026-07-01T00:00:00Z'),
-    rewardBudgetShards: 2_000n,
+    rewardBudgetWei: 2_000n,
   })
   assert.notEqual(one.id, two.id)
-  assert.equal(two.rewardBudgetShards, 2_000n)
+  assert.equal(two.rewardBudgetWei, 2_000n)
 })
 
 test('a budget cannot be lowered below what has already been paid', { skip }, async () => {
@@ -423,7 +464,7 @@ test('a budget cannot be lowered below what has already been paid', { skip }, as
     seasonId,
     userId: ALICE,
     reason: 'a',
-    amountShards: 500n,
+    amountWei: 500n,
     actor: 'service:worlds',
     correlationId: 'req-2',
   })
@@ -437,9 +478,9 @@ test('a budget cannot be lowered below what has already been paid', { skip }, as
         name: 'Season One',
         startsAt: new Date('2026-01-01T00:00:00Z'),
         endsAt: new Date('2026-04-01T00:00:00Z'),
-        rewardBudgetShards: 100n,
+        rewardBudgetWei: 100n,
       }),
-    /seasons_within_budget/,
+    /seasons_within_budget_wei/,
   )
 })
 
@@ -455,7 +496,7 @@ test('a budget cannot be lowered below what has already been paid', { skip }, as
  * sentence while the budget was a game-balance number.
  *
  * Migration 9 ended that. A season is funded from `engagement:worlds`, rewards debit that account,
- * and `reward_budget_shards` is now a **spending limit on real platform money**. Doc 21 is
+ * and that budget column is now a **spending limit on real platform money**. Doc 21 is
  * explicit about what that makes it: §6 lists `engagement.policy.set` as "required to raise, not
  * to lower", §7.7 requires the asymmetry to be proven by test, and
  * `admin-api/src/migrations.ts` already enforces it on `engagement_policies`. A re-open that
@@ -472,7 +513,7 @@ test('a budget cannot be lowered below what has already been paid', { skip }, as
 /** The re-open an operator does: same title, same slug, whatever budget is passed. */
 async function reopen(
   titleId: string,
-  rewardBudgetShards: bigint,
+  rewardBudgetWei: bigint,
   budgetRaiseApprovalId?: string,
 ): Promise<Season> {
   return openSeason(db, {
@@ -481,7 +522,7 @@ async function reopen(
     name: 'Season One, renamed',
     startsAt: new Date('2026-01-01T00:00:00Z'),
     endsAt: new Date('2026-05-01T00:00:00Z'),
-    rewardBudgetShards,
+    rewardBudgetWei,
     ...(budgetRaiseApprovalId === undefined ? {} : { budgetRaiseApprovalId }),
   })
 }
@@ -503,7 +544,7 @@ test('a re-open cannot SILENTLY raise the budget — that is a spending limit', 
 
   // And nothing moved. A refusal that half-applied would be worse than the raise it refused.
   const after = await findSeason(db, seasonId)
-  assert.equal(after?.rewardBudgetShards, 1_000n)
+  assert.equal(after?.rewardBudgetWei, 1_000n)
   assert.equal(after?.name, 'Season One', 'the whole upsert rolled back, name included')
   assert.equal(after?.budgetRaiseApprovalId, null)
 })
@@ -511,10 +552,10 @@ test('a re-open cannot SILENTLY raise the budget — that is a spending limit', 
 test('a re-open MAY lower the budget, and needs nobody to say so', { skip }, async () => {
   // The other half of 21 §7.7, and the half that stops this guard from being a blanket refusal:
   // spending LESS of the treasury's money must never need a meeting. Still floored by
-  // seasons_within_budget, which the test above this block proves separately.
+  // seasons_within_budget_wei, which the test above this block proves separately.
   const seasonId = await aSeason(1_000n)
   const lowered = await reopen(await titleOf(seasonId), 400n)
-  assert.equal(lowered.rewardBudgetShards, 400n)
+  assert.equal(lowered.rewardBudgetWei, 400n)
   assert.equal(lowered.name, 'Season One, renamed', 'the rest of the re-open still applies')
   assert.equal(lowered.budgetRaiseApprovalId, null, 'lowering names nobody, so nobody is recorded')
 })
@@ -524,7 +565,7 @@ test('a raise with an approval lands, and the row says what authorised it', { sk
   const titleId = await titleOf(seasonId)
 
   const raised = await reopen(titleId, 50_000n, 'approval-9f3c')
-  assert.equal(raised.rewardBudgetShards, 50_000n)
+  assert.equal(raised.rewardBudgetWei, 50_000n)
   assert.equal(raised.budgetRaiseApprovalId, 'approval-9f3c')
 
   // Spent. One approval is one raise — otherwise the first approved raise would be a standing
@@ -537,7 +578,7 @@ test('a raise with an approval lands, and the row says what authorised it', { sk
     () => reopen(titleId, 90_000n),
     (err: unknown) => err instanceof BudgetRaiseNeedsApprovalError,
   )
-  assert.equal((await findSeason(db, seasonId))?.rewardBudgetShards, 50_000n)
+  assert.equal((await findSeason(db, seasonId))?.rewardBudgetWei, 50_000n)
 })
 
 test('the ordinary re-open — same budget, new name — still just works', { skip }, async () => {
@@ -547,5 +588,5 @@ test('the ordinary re-open — same budget, new name — still just works', { sk
   const same = await reopen(await titleOf(seasonId), 1_000n)
   assert.equal(same.id, seasonId, 're-opening updates the season rather than making a second one')
   assert.equal(same.name, 'Season One, renamed')
-  assert.equal(same.rewardBudgetShards, 1_000n)
+  assert.equal(same.rewardBudgetWei, 1_000n)
 })

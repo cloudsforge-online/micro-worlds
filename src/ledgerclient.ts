@@ -23,7 +23,18 @@
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import { engagementAccount } from '@cloudsforge/contracts-money'
 import type { Actor, EntryKind, LedgerAssetCode } from '@cloudsforge/contracts-money'
+import type { IssuableAssetCode } from '@cloudsforge/contracts-chain'
 import type { LiveScope } from '@cloudsforge/contracts-auth'
+
+/**
+ * The asset a season reward is denominated in, spelled once.
+ *
+ * `IssuableAssetCode` — `Exclude<AssetCode, 'SHARD'>` in contracts-chain — and not a string or a
+ * `LedgerAssetCode`. That is the type micro-mint reached for when it moved its own charge off
+ * Shards, and the reason is the same: a build that tried to route this back through a retired
+ * asset would not compile, which is a different thing from a comment asking it not to.
+ */
+export const REWARD_ASSET: IssuableAssetCode = 'EMBER'
 
 /**
  * The scopes this service's token must carry to call this peer.
@@ -134,9 +145,32 @@ export interface LedgerClient {
  *
  * docs/ecosystem/21 §4: "every grant a service pays out references its engagement account as the
  * debit side", so that an auditor reconstructs the programme from the ledger alone. §1 names this
- * service's gap exactly — `seasons.reward_budget_shards` is required positive but "nothing
+ * service's gap exactly — `seasons.reward_budget_wei` is required positive but "nothing
  * anywhere says who funds it". This posting is the answer: the budget is an allowance against
  * `engagement:worlds`, and the money leaves that account when a reward is paid.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **BOTH LEGS ARE EMBER, AND THEY WERE SHARD UNTIL micro-org#226.**
+ *
+ * §4's promise is a promise about ONE programme, and it only holds if the leg that funds the
+ * account and the leg that spends it are the same asset. §3 funds `platform:engagement-treasury`
+ * with mined EMBER arriving as an ordinary deposit — it deletes the "→ conversion to Shards" step
+ * it used to carry, precisely so the balance is one a chain can be asked about — and §2 has read
+ * "bounded, disclosed, and denominated in EMBER" since 2026-08-07. This function went on debiting
+ * SHARD, which contracts-chain retired on 2026-08-04 and `assertIssuable` refuses by name.
+ *
+ * The old spelling was not merely mislabelled, it was inert. `engagement:worlds` in SHARD can
+ * never be funded — a SHARD deposit is refused by the ledger's own retired-asset guard
+ * (ledger/src/migrations.ts, `retired_asset_guard`), and there is no SHARD chain to deposit from
+ * — while `equity` is not overdraft-exempt. So the first reward would have been refused by the
+ * ledger for want of funds that could not be put there by any route. Measured on live mainnet
+ * 2026-08-10: 0 ledger accounts whose subject matches `engagement`, in any asset, and 0 postings
+ * of kind `reward_granted` ever, so nothing has been paid the old way and nothing is restated.
+ *
+ * The user's side is `available`/`liability` in EMBER, which is a balance 27 accounts on this
+ * estate already hold and which the withdrawal path already knows how to pay out. In SHARD it
+ * would have been a liability the platform can never issue against — see #226's own audit.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
  * It also removes a defect that would have failed in production the first time both services ran.
  * This function used to debit `(platform, SHARD, fees)` as type `expense`, while `micro-market`
@@ -162,21 +196,26 @@ export function rewardPostings(input: {
       // (subject, asset_code, purpose), so a second spelling would be a second account and would
       // split the programme's ledger in half.
       account: {
-        subject: engagementAccount('worlds', 'SHARD').subject,
-        assetCode: 'SHARD',
+        subject: engagementAccount('worlds', REWARD_ASSET).subject,
+        assetCode: REWARD_ASSET,
         purpose: 'treasury',
         type: 'equity',
       },
       direction: 'debit',
       amount: input.amount,
-      assetCode: 'SHARD',
+      assetCode: REWARD_ASSET,
       sequence: 0,
     },
     {
-      account: { subject: input.subject, assetCode: 'SHARD', purpose: 'available', type: 'liability' },
+      account: {
+        subject: input.subject,
+        assetCode: REWARD_ASSET,
+        purpose: 'available',
+        type: 'liability',
+      },
       direction: 'credit',
       amount: input.amount,
-      assetCode: 'SHARD',
+      assetCode: REWARD_ASSET,
       sequence: 1,
     },
   ]

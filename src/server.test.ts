@@ -500,14 +500,14 @@ test('a title service may ask for a reward; the budget is charged here', { skip 
     name: 'Season One',
     startsAt: new Date('2026-01-01T00:00:00Z'),
     endsAt: new Date('2026-04-01T00:00:00Z'),
-    rewardBudgetShards: 100n,
+    rewardBudgetWei: 100n,
     status: 'active',
   })
 
   const ok = await call(`/v1/seasons/${season.id}/rewards`, {
     method: 'POST',
     token: 'svc-title',
-    body: { userId: ALICE, reason: 'first_blood', amountShards: '60' },
+    body: { userId: ALICE, reason: 'first_blood', amountWei: '60' },
   })
   assert.equal(ok.status, 201)
 
@@ -515,15 +515,15 @@ test('a title service may ask for a reward; the budget is charged here', { skip 
   const refused = await call(`/v1/seasons/${season.id}/rewards`, {
     method: 'POST',
     token: 'svc-title',
-    body: { userId: BOB, reason: 'first_blood', amountShards: '60' },
+    body: { userId: BOB, reason: 'first_blood', amountWei: '60' },
   })
   assert.equal(refused.status, 422)
   assert.equal((refused.body['error'] as Record<string, unknown>)['code'], 'budget_exceeded')
   assert.equal(ledger.entries.length, 1)
 
   const budget = await call(`/v1/seasons/${season.id}/budget`, { token: 'svc-title' })
-  assert.equal(budget.body['grantedShards'], '60')
-  assert.equal(budget.body['remainingShards'], '40')
+  assert.equal(budget.body['grantedWei'], '60')
+  assert.equal(budget.body['remainingWei'], '40')
 })
 
 test('a TITLE cannot open a season, because that would let it set its own budget', { skip }, async () => {
@@ -545,13 +545,13 @@ test('a TITLE cannot open a season, because that would let it set its own budget
       name: 'Season One',
       startsAt: '2026-01-01T00:00:00Z',
       endsAt: '2026-04-01T00:00:00Z',
-      rewardBudgetShards: '999999999',
+      rewardBudgetWei: '999999999',
     },
   })
   assert.equal(res.status, 403)
 })
 
-test('a shard amount sent as a JSON number is refused rather than rounded', { skip }, async () => {
+test('a wei amount sent as a JSON number is refused rather than rounded', { skip }, async () => {
   const title = await registerTitle(db, 'worlds', {
     slug: 'ashfall',
     name: 'Ashfall',
@@ -570,7 +570,7 @@ test('a shard amount sent as a JSON number is refused rather than rounded', { sk
       name: 'Season One',
       startsAt: '2026-01-01T00:00:00Z',
       endsAt: '2026-04-01T00:00:00Z',
-      rewardBudgetShards: 100,
+      rewardBudgetWei: 100,
     },
   })
   assert.equal(res.status, 400)
@@ -600,14 +600,14 @@ test('an ADMIN re-opening a season cannot raise its budget without an approval',
   const opened = await call(`/v1/titles/${title.id}/seasons`, {
     method: 'POST',
     token: 'svc-admin',
-    body: { ...season, rewardBudgetShards: '1000' },
+    body: { ...season, rewardBudgetWei: '1000' },
   })
   assert.equal(opened.status, 201)
 
   const raised = await call(`/v1/titles/${title.id}/seasons`, {
     method: 'POST',
     token: 'svc-admin',
-    body: { ...season, rewardBudgetShards: '1000000' },
+    body: { ...season, rewardBudgetWei: '1000000' },
   })
   assert.equal(raised.status, 422)
   assert.equal((raised.body['error'] as Record<string, unknown>)['code'], 'budget_raise_needs_approval')
@@ -617,23 +617,60 @@ test('an ADMIN re-opening a season cannot raise its budget without an approval',
   const lowered = await call(`/v1/titles/${title.id}/seasons`, {
     method: 'POST',
     token: 'svc-admin',
-    body: { ...season, rewardBudgetShards: '400' },
+    body: { ...season, rewardBudgetWei: '400' },
   })
   assert.equal(lowered.status, 201)
   const body = lowered.body['season'] as Record<string, unknown>
-  assert.equal(body['rewardBudgetShards'], '400')
+  assert.equal(body['rewardBudgetWei'], '400')
   assert.equal(body['budgetRaiseApprovalId'], null)
 
   // And a raise that names an approval lands, with the row saying what authorised it.
   const approved = await call(`/v1/titles/${title.id}/seasons`, {
     method: 'POST',
     token: 'svc-admin',
-    body: { ...season, rewardBudgetShards: '1000000', budgetRaiseApprovalId: 'approval-4e1a' },
+    body: { ...season, rewardBudgetWei: '1000000', budgetRaiseApprovalId: 'approval-4e1a' },
   })
   assert.equal(approved.status, 201)
   const approvedBody = approved.body['season'] as Record<string, unknown>
-  assert.equal(approvedBody['rewardBudgetShards'], '1000000')
+  assert.equal(approvedBody['rewardBudgetWei'], '1000000')
   assert.equal(approvedBody['budgetRaiseApprovalId'], 'approval-4e1a')
+})
+
+/* ------------------------------------------- the achievement definition a title still sends */
+
+test('a title still speaking rewardShards is converted, not read at the wrong scale', { skip }, async () => {
+  // The one surface #226 could not rename in lockstep. `AchievementDefinition` in
+  // @cloudsforge/contracts-worlds still spells this field for Shards, micro-emberkin and micro-nda
+  // both send it on every catalogue sync, and neither repository is this change's to move — so the
+  // route converts at migration 11's rate instead of dropping the amount to zero. Both spellings
+  // are asserted, because a compatibility path nobody tests is a compatibility path that rots.
+  const title = await registerTitle(db, 'worlds', {
+    slug: 'ashfall',
+    name: 'Ashfall',
+    status: 'live',
+    serviceUrl: 'http://127.0.0.1:9001',
+    capabilities: ['achievements'],
+    assetScopes: [],
+    actor: 'operator:test',
+    correlationId: 'req-1',
+  })
+
+  const legacy = await call(`/v1/titles/${title.id}/achievements`, {
+    method: 'PUT',
+    token: 'svc-title',
+    body: { key: 'first_blood', name: 'First Blood', points: 10, rewardShards: '25' },
+  })
+  assert.equal(legacy.status, 200)
+  // 25 Shards is 25 US cents is 1 EMBER.
+  assert.equal((legacy.body['achievement'] as Record<string, unknown>)['rewardWei'], '1000000000000000000')
+
+  const current = await call(`/v1/titles/${title.id}/achievements`, {
+    method: 'PUT',
+    token: 'svc-title',
+    body: { key: 'first_blood', name: 'First Blood', points: 10, rewardWei: '2000000000000000000' },
+  })
+  assert.equal(current.status, 200)
+  assert.equal((current.body['achievement'] as Record<string, unknown>)['rewardWei'], '2000000000000000000')
 })
 
 /* ------------------------------------------------------------------ shape */
