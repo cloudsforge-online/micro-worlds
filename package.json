@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/worlds",
-  "version": "2026.08.33",
+  "version": "2026.08.34",
   "private": true,
   "description": "The game platform. A title registry, account-scoped player profiles, cross-title inventory with a bound flag the schema enforces, achievements, seasons, budget-capped rewards that are ledger postings, and the entitlement bridge that finally provisions the private world the estate already sells.",
   "license": "MIT",
