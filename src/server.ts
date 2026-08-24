@@ -52,6 +52,8 @@ import {
   type Principal,
 } from '@cloudsforge/auth'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
+import { NetworkUnknownError, requestNetwork, type Network } from '@cloudsforge/http'
+import type { NetworkSql } from '@cloudsforge/db'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { JobQueue } from '@cloudsforge/jobs'
 import { SEASON_SEALED_TOPIC, handleSeasonSealed } from './heraldry.ts'
@@ -118,11 +120,27 @@ export interface ServerDeps {
   readonly logger: Logger
   readonly metrics: Metrics
   readonly verifier: PrincipalVerifier
-  readonly sql: Db
+  /**
+   * The per-network SELECTOR, not a handle. Routes use `ctx.sql`; `NetworkSql` has no query
+   * methods, so reaching for the process-wide handle does not compile.
+   */
+  readonly sql: NetworkSql
+  /**
+   * The network to assume when no `CF-Network` arrives, or `undefined` to refuse. `CF_NETWORK_SINGLE`,
+   * for `pnpm dev`, which has no gateway in front of it. Never set in production.
+   */
+  readonly singleNetwork?: Network
   readonly producer: string
+  /**
+   * Boot-time value; `forRequest` replaces it with the bundle for this request's network. A reward
+   * granted against the wrong handle is a write that succeeds against the other estate's ledger.
+   */
   readonly rewards: RewardDeps
+  readonly rewardsFor: (network: Network) => RewardDeps
   readonly billing: EntitlementReader
+  /** Boot-time value; `forRequest` replaces it. An enqueue is a WRITE, so the queue is per-network. */
   readonly queue: Pick<JobQueue, 'enqueue'>
+  readonly queueFor: (network: Network) => Pick<JobQueue, 'enqueue'>
   /**
    * Every key an inbound event signature may be verified against, newest first. See the file
    * header, and `env.ts`'s `outboxAcceptSecrets` for why it is a list.
@@ -187,7 +205,32 @@ interface RequestContext {
   readonly requestId: string
   readonly log: Logger
   readonly params: Readonly<Record<string, string>>
+  /**
+   * The network THIS REQUEST belongs to, from the `CF-Network` header the gateway stamped.
+   *
+   * Not a property of the process: one pod serves both estates since the network consolidation
+   * (micro-deploy `docs/network-consolidation.md`), so "which network am I" has no answer.
+   */
+  readonly network: Network
+  /**
+   * The database handle for `network`, resolved ONCE, at the edge of the request.
+   *
+   * Every route uses this rather than reaching for the process-wide handle, because a wrong handle
+   * is not an error — it is a query that SUCCEEDS against the other estate's rows and says nothing.
+   * `deps.sql` is a `NetworkSql` with no query methods, so the mistake does not compile.
+   */
+  readonly sql: Db
 }
+
+/**
+ * Routes that answer without belonging to a network.
+ *
+ * Kubelet probes the first two and Prometheus scrapes the third; none arrives through the gateway,
+ * so none carries `CF-Network`. Refusing them makes every health probe a 500 and the pod never
+ * becomes ready. Three literal paths rather than a prefix, because this is an exemption from a data
+ * boundary; none of them queries the database.
+ */
+const OPERATIONAL_ROUTES: ReadonlySet<string> = new Set(['/livez', '/readyz', '/metrics'])
 
 interface Route {
   readonly method: string
@@ -259,23 +302,61 @@ export function createServer(deps: ServerDeps): Server {
     inFlight += 1
     deps.metrics.set('http_requests_in_flight', inFlight)
 
-    const finish = (status: number) => {
+    const finish = (status: number, metricNetwork: string) => {
       inFlight -= 1
       deps.metrics.set('http_requests_in_flight', inFlight)
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6
-      deps.metrics.increment('http_requests_total', { method, route: routeLabel, status: String(status) })
-      deps.metrics.observe('http_request_duration_ms', durationMs, { method, route: routeLabel })
+      deps.metrics.increment('http_requests_total', {
+        method,
+        route: routeLabel,
+        status: String(status),
+        // One target now serves both estates, so the network has to be on the SERIES. Labelled
+        // per target it would say nothing — micro-org#398 in a form nothing could recover.
+        network: metricNetwork,
+      })
+      deps.metrics.observe('http_request_duration_ms', durationMs, {
+        method,
+        route: routeLabel,
+        network: metricNetwork,
+      })
     }
 
-    void handle(matched, { req, url, requestId, log, params }, deps)
+    // ── THE NETWORK, THEN THE HANDLE, BEFORE ANY ROUTE RUNS ──────────────────────────────────
+    //
+    // `requestNetwork` REFUSES an unstamped request rather than assuming mainnet: a 500 is a
+    // routing fault made loud, where a default is a cross-network write nothing would ever flag.
+    //
+    // The operational endpoints are exempt because kubelet and Prometheus do not come through the
+    // gateway and never send the header. Refusing them makes the pod never become ready.
+    const networkless = matched !== undefined && OPERATIONAL_ROUTES.has(matched.path)
+    let network: Network
+    try {
+      network = networkless
+        ? (deps.singleNetwork ?? deps.sql.networks[0] ?? 'mainnet')
+        : requestNetwork(req.headers, deps.singleNetwork ? { fallback: deps.singleNetwork } : {})
+    } catch (err) {
+      log.error('request carries no usable network', {
+        err: err instanceof NetworkUnknownError ? err.message : err,
+      })
+      send(
+        res,
+        errorReply(500, 'network_unknown', 'this request could not be attributed to a network', requestId),
+        requestId,
+      )
+      finish(500, 'unknown')
+      return
+    }
+
+    const sql = deps.sql.for(network) as unknown as Db
+    void handle(matched, { req, url, requestId, log, params, network, sql }, forRequest(deps, network))
       .then((reply) => {
         send(res, reply, requestId)
-        finish(reply.status)
+        finish(reply.status, network)
       })
       .catch((err: unknown) => {
         log.error('request handler threw after mapping', { err })
         send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId)
-        finish(500)
+        finish(500, network)
       })
   })
 }
@@ -293,6 +374,15 @@ export function createServer(deps: ServerDeps): Server {
  *     and the caller needs to know it was the budget rather than a fault.
  *   * **503** — an upstream is unreachable, or a signature could not be checked.
  */
+/**
+ * The deps a REQUEST sees: everything carrying a database handle, rebuilt for this request's
+ * network. `sql` stays the selector on `deps` because routes read `ctx.sql`; what has to be swapped
+ * is anything that already CLOSED OVER a handle at boot.
+ */
+function forRequest(deps: ServerDeps, network: Network): ServerDeps {
+  return { ...deps, rewards: deps.rewardsFor(network), queue: deps.queueFor(network) }
+}
+
 async function handle(route: Route | undefined, ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
   if (!route) {
     return errorReply(404, 'not_found', `no route for ${ctx.req.method} ${ctx.url.pathname}`, ctx.requestId)
@@ -464,7 +554,7 @@ function buildRoutes(): Route[] {
         if (!seasonId) throw new BadRequestError('season.sealed must carry seasonId')
         const done = deps.lifecycle.track()
         try {
-          const result = await handleSeasonSealed(deps.sql, deps.producer, eventId, {
+          const result = await handleSeasonSealed(ctx.sql, deps.producer, eventId, {
             seasonId,
             victors: victors as never,
             correlationId:
@@ -493,7 +583,7 @@ function buildRoutes(): Route[] {
 
       const done = deps.lifecycle.track()
       try {
-        const result = await recordGrant(deps.sql, deps.producer, {
+        const result = await recordGrant(ctx.sql, deps.producer, {
           eventId,
           payload,
           actor: typeof envelope['actor'] === 'string' ? envelope['actor'] : 'service:billing',
@@ -529,7 +619,7 @@ function buildRoutes(): Route[] {
 
     /** The registry. Public: a launcher listing games cannot require a token to do it. */
     define('GET', '/v1/titles', async (ctx, deps) => {
-      const titles = await listTitles(deps.sql, ctx.url.searchParams.get('includeRetired') === 'true')
+      const titles = await listTitles(ctx.sql, ctx.url.searchParams.get('includeRetired') === 'true')
       return {
         status: 200,
         body: {
@@ -560,7 +650,7 @@ function buildRoutes(): Route[] {
         }
         if (!capabilities.includes(item)) capabilities.push(item)
       }
-      const title = await registerTitle(deps.sql, deps.producer, {
+      const title = await registerTitle(ctx.sql, deps.producer, {
         slug: requireString(body, 'slug'),
         name: requireString(body, 'name'),
         serviceUrl: requireString(body, 'serviceUrl'),
@@ -591,8 +681,8 @@ function buildRoutes(): Route[] {
       const userId = subjectUserId(principal, undefined)
       const titleScope = ctx.url.searchParams.get('titleId') ?? undefined
 
-      const profile = await findProfile(deps.sql, userId)
-      const inventory = await listInventory(deps.sql, {
+      const profile = await findProfile(ctx.sql, userId)
+      const inventory = await listInventory(ctx.sql, {
         userId,
         ...(titleScope ? { titleScope } : {}),
       })
@@ -601,7 +691,7 @@ function buildRoutes(): Route[] {
         body: {
           profile,
           inventory: inventory.map(toItemWire),
-          achievements: (await listUnlocked(deps.sql, userId, titleScope)).map((row) => ({
+          achievements: (await listUnlocked(ctx.sql, userId, titleScope)).map((row) => ({
             key: row.achievement.key,
             titleId: row.achievement.titleId,
             name: row.achievement.name,
@@ -616,7 +706,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps)
       if (principal.kind === 'service') requireScope(principal, WRITE_SCOPE)
       const body = await readJson(ctx.req)
-      const profile = await upsertProfile(deps.sql, {
+      const profile = await upsertProfile(ctx.sql, {
         userId: subjectUserId(principal, undefined),
         displayName: requireString(body, 'displayName'),
         avatarAssetUrn: typeof body['avatarAssetUrn'] === 'string' ? body['avatarAssetUrn'] : null,
@@ -653,7 +743,7 @@ function buildRoutes(): Route[] {
         if (!owned) throw new ForbiddenError('an entitlement for that cosmetic')
       }
 
-      const profile = await equipCosmetic(deps.sql, { userId, titleScope, slot, itemUrn })
+      const profile = await equipCosmetic(ctx.sql, { userId, titleScope, slot, itemUrn })
       return { status: 200, body: { profile } }
     }),
 
@@ -663,7 +753,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps)
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
       const titleScope = ctx.url.searchParams.get('titleId') ?? undefined
-      const items = await listInventory(deps.sql, {
+      const items = await listInventory(ctx.sql, {
         userId: subjectUserId(principal, undefined),
         ...(titleScope ? { titleScope } : {}),
       })
@@ -682,7 +772,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps)
       if (principal.kind === 'service') requireScope(principal, WRITE_SCOPE)
       const body = await readJson(ctx.req)
-      const item = await listForSale(deps.sql, deps.producer, {
+      const item = await listForSale(ctx.sql, deps.producer, {
         itemId: itemIdOf(ctx),
         userId: subjectUserId(principal, undefined),
         listingUrn: requireString(body, 'listingUrn'),
@@ -695,7 +785,7 @@ function buildRoutes(): Route[] {
     define('DELETE', '/v1/players/me/inventory/:id/list', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       if (principal.kind === 'service') requireScope(principal, WRITE_SCOPE)
-      const item = await unlist(deps.sql, itemIdOf(ctx), subjectUserId(principal, undefined))
+      const item = await unlist(ctx.sql, itemIdOf(ctx), subjectUserId(principal, undefined))
       if (!item) throw new NotFoundError('no such listing')
       return { status: 200, body: { item: toItemWire(item) } }
     }),
@@ -709,13 +799,13 @@ function buildRoutes(): Route[] {
       // An operator may read the whole backlog — which is the fifth of the six missing pieces:
       // there is no view of failed rentals anywhere in the estate today.
       if (isAdmin(principal) || (principal.kind === 'service' && hasScope(principal, ADMIN_SCOPE))) {
-        const rows = await listProvisions(deps.sql, {
+        const rows = await listProvisions(ctx.sql, {
           ...(state ? { state: state as ProvisionState } : {}),
         })
         return { status: 200, body: { provisions: rows } }
       }
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
-      const rows = await listProvisions(deps.sql, {
+      const rows = await listProvisions(ctx.sql, {
         subject: `user:${subjectUserId(principal, undefined)}`,
         ...(state ? { state: state as ProvisionState } : {}),
       })
@@ -733,7 +823,7 @@ function buildRoutes(): Route[] {
       if (principal.kind === 'service') requireScope(principal, ADMIN_SCOPE)
       else if (!isAdmin(principal)) throw new ForbiddenError(`${ADMIN_SCOPE} or role:admin`)
 
-      const provision = await reopenProvision(deps.sql, itemIdOf(ctx))
+      const provision = await reopenProvision(ctx.sql, itemIdOf(ctx))
       if (!provision) throw new NotFoundError('no failed provision with that id')
       await deps.queue.enqueue({
         kind: PROVISION_KIND,
@@ -747,7 +837,7 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/provisions/:id', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
-      const provision = await findProvision(deps.sql, itemIdOf(ctx))
+      const provision = await findProvision(ctx.sql, itemIdOf(ctx))
       if (!provision) throw new NotFoundError('no such provision')
       // "Does not exist" and "is not yours" are the same answer on purpose.
       if (
@@ -763,7 +853,7 @@ function buildRoutes(): Route[] {
     /* ------------------------------------------------------------------ achievements and seasons */
 
     define('GET', '/v1/titles/:id/achievements', async (ctx, deps) => {
-      const achievements = await listAchievements(deps.sql, itemIdOf(ctx))
+      const achievements = await listAchievements(ctx.sql, itemIdOf(ctx))
       return {
         status: 200,
         body: {
@@ -782,7 +872,7 @@ function buildRoutes(): Route[] {
       if (principal.kind === 'service') requireScope(principal, TITLE_SCOPE)
       else if (!isAdmin(principal)) throw new ForbiddenError(`${TITLE_SCOPE} or role:admin`)
       const body = await readJson(ctx.req)
-      const achievement = await defineAchievement(deps.sql, {
+      const achievement = await defineAchievement(ctx.sql, {
         titleId: itemIdOf(ctx),
         key: requireString(body, 'key'),
         name: requireString(body, 'name'),
@@ -801,7 +891,7 @@ function buildRoutes(): Route[] {
       if (principal.kind === 'service') requireScope(principal, TITLE_SCOPE)
       else if (!isAdmin(principal)) throw new ForbiddenError(`${TITLE_SCOPE} or role:admin`)
       const body = await readJson(ctx.req)
-      const result = await unlockAchievement(deps.sql, deps.producer, {
+      const result = await unlockAchievement(ctx.sql, deps.producer, {
         userId: requireString(body, 'userId'),
         titleId: itemIdOf(ctx),
         key: requireString(body, 'key'),
@@ -817,7 +907,7 @@ function buildRoutes(): Route[] {
     }),
 
     define('GET', '/v1/titles/:id/seasons', async (ctx, deps) => {
-      const seasons = await listSeasons(deps.sql, itemIdOf(ctx))
+      const seasons = await listSeasons(ctx.sql, itemIdOf(ctx))
       return { status: 200, body: { seasons: seasons.map(toSeasonWire) } }
     }),
 
@@ -828,7 +918,7 @@ function buildRoutes(): Route[] {
       if (principal.kind === 'service') requireScope(principal, ADMIN_SCOPE)
       else if (!isAdmin(principal)) throw new ForbiddenError(`${ADMIN_SCOPE} or role:admin`)
       const body = await readJson(ctx.req)
-      const season = await openSeason(deps.sql, {
+      const season = await openSeason(ctx.sql, {
         titleId: itemIdOf(ctx),
         slug: requireString(body, 'slug'),
         name: requireString(body, 'name'),
@@ -848,7 +938,7 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/seasons/:id/budget', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
-      const budget = await seasonBudget(deps.sql, itemIdOf(ctx))
+      const budget = await seasonBudget(ctx.sql, itemIdOf(ctx))
       if (!budget) throw new NotFoundError('no such season')
       return {
         status: 200,

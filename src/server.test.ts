@@ -6,6 +6,7 @@
  * bought a private world and get one raised.
  */
 
+import { networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test, { after, before, beforeEach } from 'node:test'
@@ -95,15 +96,22 @@ before(async () => {
     logger: new Logger({ service: 'worlds-test', level: 'fatal', sink: () => {} }),
     metrics,
     verifier,
-    sql: db,
+    sql: singleNetworkSql(db),
+    singleNetwork: 'mainnet' as const,
     producer: 'worlds',
     rewards: { sql: db, ledger, producer: 'worlds' },
+    rewardsFor: () => ({ sql: db, ledger, producer: 'worlds' }),
     billing,
     queue: {
       async enqueue(options) {
         enqueued.push({ kind: options.kind, key: options.key })
       },
     },
+    queueFor: () => ({
+      async enqueue(options: { kind: string; key: string }) {
+        enqueued.push({ kind: options.kind, key: options.key })
+      },
+    }),
     eventAcceptSecrets: [NEXT_SECRET, SECRET],
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
@@ -780,3 +788,11 @@ test('a second sealed season grants again — the per-user idempotency is per SE
   assert.equal(mine[0]!.n, 2, 'one banner per season, not one banner ever')
 })
 
+/**
+ * One handle, presented as the per-network selector the server now takes. The fixture runs against
+ * a single test database, so mainnet is the only configured network — which exercises the REFUSAL
+ * path for free: anything reaching for testnet throws rather than reusing this handle.
+ */
+function singleNetworkSql(db: unknown) {
+  return networkSql({ mainnet: db as RuntimeSql })
+}
