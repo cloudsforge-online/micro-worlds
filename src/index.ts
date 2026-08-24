@@ -31,6 +31,17 @@ import { buildUpstreams } from './upstreams.ts'
 import type { Db } from './outbox.ts'
 import type { ProvisionDeps } from './provisioning.ts'
 
+// ── WHICH ESTATE THIS DEPLOYMENT IS ─────────────────────────────────────────────────────────
+//
+// Every per-network map in this file keys its primary entry by THIS, never by the literal
+// `mainnet`. Same image, same code, different env: a testnet pod that hardcodes the key holds
+// its own database and its own queue under the other estate's name, and then refuses — or, when
+// the throw escapes a request listener, DIES — on every request the gateway correctly stamped.
+//
+// It happened twice. The handle, then the job plane.
+const ownNetwork = (env.singleNetwork || 'mainnet') as 'mainnet' | 'testnet'
+
+
 // 1. Environment. Importing `./env.ts` validated it; a missing or placeholder secret has already
 //    exited with a structured line naming the variable.
 
@@ -166,8 +177,8 @@ lifecycle
 const db = sql as unknown as Db
 const dbTestnet = sqlTestnet ? (sqlTestnet as unknown as Db) : undefined
 const networks: ReadonlyArray<readonly ['mainnet' | 'testnet', typeof sql, Db]> = [
-  ['mainnet', sql, db],
-  ...(sqlTestnet && dbTestnet ? ([['testnet', sqlTestnet, dbTestnet]] as const) : []),
+  [ownNetwork, sql, db],
+  ...(sqlTestnet && dbTestnet && ownNetwork !== 'testnet' ? ([['testnet', sqlTestnet, dbTestnet]] as const) : []),
 ]
 const queueFor = (handle: typeof sql) =>
   new JobQueue(handle as unknown as JobsSql, {
@@ -210,18 +221,6 @@ const planeFor = (network: 'mainnet' | 'testnet') => {
 // 8. Routes. After the Lifecycle so the health handlers report real state, and after the pool so
 //    the stores are real rather than a lazily-connected surprise on the first request.
 const verifier = new Verifier({ jwksUrl: env.identityJwksUrl, issuer: env.identityIssuer })
-// ── WHICH ESTATE THIS DEPLOYMENT IS ─────────────────────────────────────────────────────────
-//
-// The `networkSql` key below used to be the literal `mainnet`. Same image, same code,
-// different env — so the TESTNET pod registered its testnet DSN under the name `mainnet` and
-// then refused every request the gateway stamped `CF-Network: testnet`, because it genuinely
-// held no handle by that name. Five services crash-looped on it within ten minutes of the
-// first deploy: the refusal was right, the registration was wrong.
-//
-// `CF_NETWORK_SINGLE` is how a single-network pod says which estate it is. The render sets it
-// for every deployment; `mainnet` remains the default only for a bare `pnpm dev`.
-const ownNetwork = (env.singleNetwork || 'mainnet') as 'mainnet' | 'testnet'
-
 const server = createServer({
   lifecycle,
   logger,
@@ -230,7 +229,7 @@ const server = createServer({
   // The SELECTOR, not a handle — routes use `ctx.sql`, resolved once per request.
   sql: networkSql({
     [ownNetwork]: sql as unknown as RuntimeSql,
-    ...(sqlTestnet ? { testnet: sqlTestnet as unknown as RuntimeSql } : {}),
+    ...(sqlTestnet && ownNetwork !== 'testnet' ? { testnet: sqlTestnet as unknown as RuntimeSql } : {}),
   }),
   // The fallback for a request with no `CF-Network` header — which is EVERY service-to-service
   // call, because those go container to container and never reach the gateway that stamps one.
@@ -248,7 +247,7 @@ const server = createServer({
     producer: SERVICE,
   }),
   billing,
-  queue: planeFor('mainnet').queue,
+  queue: planeFor(ownNetwork).queue,
   queueFor: (network: 'mainnet' | 'testnet') => planeFor(network).queue,
   // Every key billing's relay may have signed with, newest first — `[OUTBOX_SIGNING_SECRET]` unless
   // a rotation is in progress. See the header of `server.ts`: an unsigned provisioning webhook is a
