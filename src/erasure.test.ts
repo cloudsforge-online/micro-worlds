@@ -67,17 +67,23 @@ async function erase(userId: string): Promise<ErasureOutcome> {
 
 /** One of everything this service can hold about a person, for two people. */
 async function seed(): Promise<{ titleId: string; seasonId: string; achievementId: string }> {
+  // `titles_slug_shape` is `^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$` — three characters minimum. A
+  // one-letter fixture slug is the kind of thing that only fails where the database is, which is
+  // why this file is worth running against a real one.
   const [title] = await sql<{ id: string }[]>`
-    insert into titles (slug, name, service_url) values ('t', 'T', 'http://t') returning id
+    insert into titles (slug, name, service_url)
+    values ('erasure-title', 'Erasure', 'http://erasure.invalid') returning id
   `
   const titleId = title!.id
   const [season] = await sql<{ id: string }[]>`
     insert into seasons (title_id, slug, name, starts_at, ends_at, reward_budget_shards)
-    values (${titleId}, 's', 'S', now(), now() + interval '30 days', 1000) returning id
+    values (${titleId}, 'erasure-season', 'Erasure', now(), now() + interval '30 days', 1000)
+    returning id
   `
   const seasonId = season!.id
   const [achievement] = await sql<{ id: string }[]>`
-    insert into achievements (title_id, key, name) values (${titleId}, 'k', 'A') returning id
+    insert into achievements (title_id, key, name)
+    values (${titleId}, 'erasure-key', 'Erasure') returning id
   `
   const achievementId = achievement!.id
 
