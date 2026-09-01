@@ -76,7 +76,7 @@ async function seed(): Promise<{ titleId: string; seasonId: string; achievementI
   `
   const titleId = title!.id
   const [season] = await sql<{ id: string }[]>`
-    insert into seasons (title_id, slug, name, starts_at, ends_at, reward_budget_shards)
+    insert into seasons (title_id, slug, name, starts_at, ends_at, reward_budget_wei)
     values (${titleId}, 'erasure-season', 'Erasure', now(), now() + interval '30 days', 1000)
     returning id
   `
@@ -95,7 +95,7 @@ async function seed(): Promise<{ titleId: string; seasonId: string; achievementI
       values (${user}, '*', 'urn:item:1', 'reward')
     `
     await sql`
-      insert into reward_grants (season_id, user_id, title_id, reason, amount_shards, journal_entry_id, idempotency_key)
+      insert into reward_grants (season_id, user_id, title_id, reason, amount_wei, journal_entry_id, idempotency_key)
       values (${seasonId}, ${user}, ${titleId}, 'season', 10, ${'journal-' + user}, ${'key-' + user})
     `
     await sql`
@@ -152,12 +152,12 @@ test('ERASURE: the retained rows keep the facts they are retained FOR', { skip }
 
   // reward_grants is kept for the ledger link and the double-grant guard. Both must survive, or
   // retaining the row bought nothing and the erasure should have deleted it.
-  const [grant] = await sql<{ journal_entry_id: string; idempotency_key: string; amount_shards: string }[]>`
-    select journal_entry_id, idempotency_key, amount_shards from reward_grants
+  const [grant] = await sql<{ journal_entry_id: string; idempotency_key: string; amount_wei: string }[]>`
+    select journal_entry_id, idempotency_key, amount_wei from reward_grants
      where idempotency_key = ${'key-' + ALICE}
   `
   assert.equal(grant?.journal_entry_id, 'journal-' + ALICE)
-  assert.equal(grant?.amount_shards, '10')
+  assert.equal(grant?.amount_wei, '10')
 
   // provisions is kept so one purchase cannot become two. The entitlement is the uniqueness key.
   const [provision] = await sql<{ entitlement_id: string; sku: string; subject: string }[]>`
