@@ -57,7 +57,8 @@ import type { NetworkSql } from '@cloudsforge/db'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { JobQueue } from '@cloudsforge/jobs'
 import { SEASON_SEALED_TOPIC, handleSeasonSealed } from './heraldry.ts'
-import { SIGNATURE_HEADER, verifyEventSignature, type Db } from './outbox.ts'
+import { SIGNATURE_HEADER, verifyEventSignature, withInbox, type Db } from './outbox.ts'
+import { USER_DELETED_TOPIC, eraseUser } from './erasure.ts'
 import {
   isCapability,
   listTitles,
@@ -595,6 +596,34 @@ function buildRoutes(): Route[] {
           }
           ctx.log.info('heraldry granted', { seasonId, ...result.outcome })
           return { status: 202, body: { status: 'granted', ...result.outcome } }
+        } finally {
+          done()
+        }
+      }
+      if (topic === USER_DELETED_TOPIC) {
+        // Right to erasure. See src/erasure.ts for the table-by-table decisions and the lawful
+        // basis for each row that is kept — this service stores a user id in six places and, until
+        // micro-org#491, erased none of them.
+        const raw = envelope['payload']
+        const payload =
+          typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+            ? (raw as Record<string, unknown>)
+            : {}
+        const userId = typeof payload['userId'] === 'string' ? payload['userId'] : ''
+        if (!UUID.test(userId)) {
+          deps.metrics.increment('worlds_events_rejected_total', { reason: 'malformed' })
+          throw new BadRequestError(`${USER_DELETED_TOPIC} requires a uuid userId`)
+        }
+        const done = deps.lifecycle.track()
+        try {
+          const outcome = await withInbox(ctx.sql, topic, eventId, (tx) => eraseUser(tx, userId))
+          if (outcome.status === 'duplicate') {
+            return { status: 200, body: { status: 'duplicate', eventId } }
+          }
+          // COUNTS ONLY. The erased id is never logged: writing it into the log would recreate, in
+          // the one store nothing erases, exactly what the request was to remove.
+          ctx.log.info('user erased', { eventId, ...outcome.value })
+          return { status: 202, body: { status: 'erased' } }
         } finally {
           done()
         }
