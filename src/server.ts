@@ -616,13 +616,39 @@ function buildRoutes(): Route[] {
         }
         const done = deps.lifecycle.track()
         try {
-          const outcome = await withInbox(ctx.sql, topic, eventId, (tx) => eraseUser(tx, userId))
+          /*
+           * EVERY NETWORK THIS PROCESS SERVES, not the one this request resolved to.
+           *
+           * `identity.user.deleted` is not network-scoped — identity holds ONE account set for
+           * both networks (micro-org#459), so a person who asks to be forgotten is asking about
+           * themselves, not about a network. But `ctx.sql` resolves to a single database, and for
+           * an inbound service-to-service event with no `CF-Network` header that is the
+           * `singleNetwork` fallback. Erasing through it would clear `worlds` and leave
+           * `worlds_testnet` — which holds rows — untouched. micro-org#474.
+           *
+           * ORDER MATTERS. The erasures run BEFORE the inbox record, so a failure on any network
+           * throws before the event is marked handled and the whole thing is retried. The reverse
+           * order would commit "handled" and then fail, leaving one network erased for ever with
+           * nothing to re-drive it.
+           *
+           * The cost of that order is that a DUPLICATE delivery re-runs the erasures before
+           * `withInbox` recognises it. That is safe rather than merely tolerable: every statement
+           * in `eraseUser` is keyed on the id it is removing, so a second pass matches nothing.
+           */
+          const erased: Record<string, unknown> = {}
+          await deps.sql.each(async (sql, network) => {
+            erased[network] = await (sql as unknown as Db).begin((tx) =>
+              eraseUser(tx as unknown as Parameters<typeof eraseUser>[0], userId),
+            )
+          })
+
+          const outcome = await withInbox(ctx.sql, topic, eventId, async () => erased)
           if (outcome.status === 'duplicate') {
             return { status: 200, body: { status: 'duplicate', eventId } }
           }
-          // COUNTS ONLY. The erased id is never logged: writing it into the log would recreate, in
-          // the one store nothing erases, exactly what the request was to remove.
-          ctx.log.info('user erased', { eventId, ...outcome.value })
+          // COUNTS ONLY, PER NETWORK. The erased id is never logged: writing it into the log would
+          // recreate, in the one store nothing erases, exactly what the request was to remove.
+          ctx.log.info('user erased', { eventId, ...erased })
           return { status: 202, body: { status: 'erased' } }
         } finally {
           done()
