@@ -96,11 +96,12 @@ async function seed(): Promise<{ titleId: string; seasonId: string; achievementI
     `
     await sql`
       insert into reward_grants (season_id, user_id, title_id, reason, amount_wei, journal_entry_id, idempotency_key)
-      values (${seasonId}, ${user}, ${titleId}, 'season', 10, ${'journal-' + user}, ${'key-' + user})
+      values (${seasonId}, ${user}, ${titleId}, 'season', 10, ${'journal-' + user.slice(0, 4)},
+              ${`worlds:reward:${seasonId}:${user}:season`})
     `
     await sql`
       insert into provisions (entitlement_id, subject, sku, scope, kind, metadata)
-      values (${'ent-' + user}, ${'user:' + user}, 'sku', '*', 'cosmetic',
+      values (${'ent-' + user.slice(0, 4)}, ${'user:' + user}, 'sku', '*', 'cosmetic',
               ${sql.json({ buyer: user })})
     `
     await sql`
@@ -154,14 +155,14 @@ test('ERASURE: the retained rows keep the facts they are retained FOR', { skip }
   // retaining the row bought nothing and the erasure should have deleted it.
   const [grant] = await sql<{ journal_entry_id: string; idempotency_key: string; amount_wei: string }[]>`
     select journal_entry_id, idempotency_key, amount_wei from reward_grants
-     where idempotency_key = ${'key-' + ALICE}
+     where journal_entry_id = ${'journal-' + ALICE.slice(0, 4)}
   `
-  assert.equal(grant?.journal_entry_id, 'journal-' + ALICE)
+  assert.equal(grant?.journal_entry_id, 'journal-' + ALICE.slice(0, 4))
   assert.equal(grant?.amount_wei, '10')
 
   // provisions is kept so one purchase cannot become two. The entitlement is the uniqueness key.
   const [provision] = await sql<{ entitlement_id: string; sku: string; subject: string }[]>`
-    select entitlement_id, sku, subject from provisions where entitlement_id = ${'ent-' + ALICE}
+    select entitlement_id, sku, subject from provisions where entitlement_id = ${'ent-' + ALICE.slice(0, 4)}
   `
   assert.equal(provision?.sku, 'sku')
   // The erased spelling, never a bare uuid and never null — `subject` is `not null`.

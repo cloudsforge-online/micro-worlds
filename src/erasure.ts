@@ -88,8 +88,25 @@ export async function eraseUser(tx: Tx, userId: string): Promise<ErasureOutcome>
   /* ------------------------------------------------------------------ retained, narrowed */
 
   // The ledger link and the double-grant guard survive; the person does not. See the table above.
+  /*
+   * `idempotency_key` TOO, AND THAT IS NOT OBVIOUS FROM THE COLUMN NAME.
+   *
+   * `rewardIdempotencyKey` builds `worlds:reward:<season>:<user>:<reason>` — the id is embedded
+   * verbatim in a text column, and the same string is the key the LEDGER posted the entry under.
+   * Rewriting only `user_id` would leave the person named in a column nobody would think to look
+   * at, which is exactly what `erasure.test.ts`'s catalogue sweep exists to catch, and did.
+   *
+   * Rewriting it keeps the guard working: the placeholder is unique, so the row still occupies one
+   * slot under `reward_grants_key_uniq` and no second grant can take it. What is given up is that
+   * a retry of THIS grant would no longer dedupe against it — which cannot happen, because the
+   * person it would be granted to has been deleted.
+   */
   const grants = await tx`
-    update reward_grants set user_id = ${placeholder} where user_id = ${userId} returning 1
+    update reward_grants
+       set user_id         = ${placeholder},
+           idempotency_key = replace(idempotency_key, ${userId}, ${placeholder})
+     where user_id = ${userId} or idempotency_key like ${anywhere}
+    returning 1
   `
 
   // `subject` is billing's spelling; `metadata` is swept because the bridge copies the entitlement
